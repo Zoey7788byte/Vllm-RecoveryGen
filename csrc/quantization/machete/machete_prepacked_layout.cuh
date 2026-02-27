@@ -98,7 +98,8 @@ struct PrepackedLayoutBTemplate {
   // For coop schedules we have two warp groups cooperatively issuing wgmma
   // instructions so we use 2 atoms along the M dim (one for each warpgroup)
   using AtomLayoutMNK = cute::conditional_t<
-      cute::is_same_v<KernelSchedule, KernelTmaWarpSpecializedCooperative>,
+      cute::is_same_v<KernelSchedule,
+                      KernelTmaWarpSpecializedCooperativeMixedInput>,
       Layout<Shape<_2, _1, _1>>, Layout<Shape<_1, _1, _1>>>;
 
   using TiledMma = decltype(cute::make_tiled_mma(
@@ -187,12 +188,8 @@ struct PrepackedLayoutBTemplate {
   CUTE_HOST_DEVICE static constexpr auto TVbNbKL_to_offset_copy(
       Shape_NKL shape_mkl) {
     auto layout = TVbNbKL_to_offset(shape_mkl);
-    // for 4-bit elements, having >= 64 values per column
-    // allows TMA to load full 32-byte sectors
-    auto inner_layout =
-        make_layout(make_shape(_256{}, size<0>(layout) / _256{}));
-
-    return make_layout(inner_layout, get<1>(layout), get<2>(layout));
+    return make_layout(coalesce(get<0>(layout)), get<1>(layout),
+                       get<2>(layout));
   }
 
   // ((BlockN, BlockK), (BlocksN, BlocksK), L) -> (storage_idx)

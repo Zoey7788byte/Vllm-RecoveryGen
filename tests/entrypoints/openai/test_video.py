@@ -1,32 +1,31 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
-import json
+from typing import Dict, List
 
 import openai
 import pytest
 import pytest_asyncio
 
-from vllm.multimodal.utils import encode_video_url, fetch_video
-from vllm.platforms import current_platform
+from vllm.multimodal.utils import encode_video_base64, fetch_video
 
 from ...utils import RemoteOpenAIServer
 
 MODEL_NAME = "llava-hf/llava-onevision-qwen2-0.5b-ov-hf"
-MAXIMUM_VIDEOS = 3
+MAXIMUM_VIDEOS = 4
 
 TEST_VIDEO_URLS = [
-    "https://www.bogotobogo.com/python/OpenCV_Python/images/mean_shift_tracking/slow_traffic_small.mp4",
-    "https://github.com/opencv/opencv/raw/refs/tags/4.12.0/samples/data/vtest.avi",
-    "https://github.com/opencv/opencv/raw/refs/tags/4.12.0/samples/data/Megamind.avi",
+    "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
+    "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4",
+    "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+    "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
 ]
 
 
 @pytest.fixture(scope="module")
 def server():
     args = [
-        "--runner",
+        "--task",
         "generate",
+        "--dtype",
+        "bfloat16",
         "--max-model-len",
         "32768",
         "--max-num-seqs",
@@ -34,19 +33,10 @@ def server():
         "--enforce-eager",
         "--trust-remote-code",
         "--limit-mm-per-prompt",
-        json.dumps({"video": MAXIMUM_VIDEOS}),
+        f"video={MAXIMUM_VIDEOS}",
     ]
 
-    # ROCm: Increase timeouts to handle potential network delays and slower
-    # video processing when downloading multiple videos from external sources
-    env_overrides = {}
-    if current_platform.is_rocm():
-        env_overrides = {
-            "VLLM_VIDEO_FETCH_TIMEOUT": "120",
-            "VLLM_ENGINE_ITERATION_TIMEOUT_S": "300",
-        }
-
-    with RemoteOpenAIServer(MODEL_NAME, args, env_dict=env_overrides) as remote_server:
+    with RemoteOpenAIServer(MODEL_NAME, args) as remote_server:
         yield remote_server
 
 
@@ -57,41 +47,34 @@ async def client(server):
 
 
 @pytest.fixture(scope="session")
-def url_encoded_video() -> dict[str, str]:
+def base64_encoded_video() -> Dict[str, str]:
     return {
-        video_url: encode_video_url(fetch_video(video_url)[0])
+        video_url: encode_video_base64(fetch_video(video_url))
         for video_url in TEST_VIDEO_URLS
     }
-
-
-def dummy_messages_from_video_url(
-    video_urls: str | list[str],
-    content_text: str = "What's in this video?",
-):
-    if isinstance(video_urls, str):
-        video_urls = [video_urls]
-
-    return [
-        {
-            "role": "user",
-            "content": [
-                *(
-                    {"type": "video_url", "video_url": {"url": video_url}}
-                    for video_url in video_urls
-                ),
-                {"type": "text", "text": content_text},
-            ],
-        }
-    ]
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
 @pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
-async def test_single_chat_session_video(
-    client: openai.AsyncOpenAI, model_name: str, video_url: str
-):
-    messages = dummy_messages_from_video_url(video_url)
+async def test_single_chat_session_video(client: openai.AsyncOpenAI,
+                                         model_name: str, video_url: str):
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": video_url
+                }
+            },
+            {
+                "type": "text",
+                "text": "What's in this video?"
+            },
+        ],
+    }]
 
     # test single completion
     chat_completion = await client.chat.completions.create(
@@ -100,15 +83,13 @@ async def test_single_chat_session_video(
         max_completion_tokens=10,
         logprobs=True,
         temperature=0.0,
-        top_logprobs=5,
-    )
+        top_logprobs=5)
     assert len(chat_completion.choices) == 1
 
     choice = chat_completion.choices[0]
     assert choice.finish_reason == "length"
     assert chat_completion.usage == openai.types.CompletionUsage(
-        completion_tokens=10, prompt_tokens=6287, total_tokens=6297
-    )
+        completion_tokens=10, prompt_tokens=6299, total_tokens=6309)
 
     message = choice.message
     message = chat_completion.choices[0].message
@@ -130,36 +111,25 @@ async def test_single_chat_session_video(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
 @pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
-async def test_error_on_invalid_video_url_type(
-    client: openai.AsyncOpenAI, model_name: str, video_url: str
-):
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "video_url", "video_url": video_url},
-                {"type": "text", "text": "What's in this video?"},
-            ],
-        }
-    ]
-
-    # video_url should be a dict {"url": "some url"}, not directly a string
-    with pytest.raises(openai.BadRequestError):
-        _ = await client.chat.completions.create(
-            model=model_name,
-            messages=messages,
-            max_completion_tokens=10,
-            temperature=0.0,
-        )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("model_name", [MODEL_NAME])
-@pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
-async def test_single_chat_session_video_beamsearch(
-    client: openai.AsyncOpenAI, model_name: str, video_url: str
-):
-    messages = dummy_messages_from_video_url(video_url)
+async def test_single_chat_session_video_beamsearch(client: openai.AsyncOpenAI,
+                                                    model_name: str,
+                                                    video_url: str):
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": video_url
+                }
+            },
+            {
+                "type": "text",
+                "text": "What's in this video?"
+            },
+        ],
+    }]
 
     chat_completion = await client.chat.completions.create(
         model=model_name,
@@ -168,25 +138,36 @@ async def test_single_chat_session_video_beamsearch(
         max_completion_tokens=10,
         logprobs=True,
         top_logprobs=5,
-        extra_body=dict(use_beam_search=True),
-    )
+        extra_body=dict(use_beam_search=True))
     assert len(chat_completion.choices) == 2
-    assert (
-        chat_completion.choices[0].message.content
-        != chat_completion.choices[1].message.content
-    )
+    assert chat_completion.choices[
+        0].message.content != chat_completion.choices[1].message.content
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
 @pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
 async def test_single_chat_session_video_base64encoded(
-    client: openai.AsyncOpenAI,
-    model_name: str,
-    video_url: str,
-    url_encoded_video: dict[str, str],
-):
-    messages = dummy_messages_from_video_url(url_encoded_video[video_url])
+        client: openai.AsyncOpenAI, model_name: str, video_url: str,
+        base64_encoded_video: Dict[str, str]):
+
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url":
+                    f"data:video/jpeg;base64,{base64_encoded_video[video_url]}"
+                }
+            },
+            {
+                "type": "text",
+                "text": "What's in this video?"
+            },
+        ],
+    }]
 
     # test single completion
     chat_completion = await client.chat.completions.create(
@@ -195,15 +176,13 @@ async def test_single_chat_session_video_base64encoded(
         max_completion_tokens=10,
         logprobs=True,
         temperature=0.0,
-        top_logprobs=5,
-    )
+        top_logprobs=5)
     assert len(chat_completion.choices) == 1
 
     choice = chat_completion.choices[0]
     assert choice.finish_reason == "length"
     assert chat_completion.usage == openai.types.CompletionUsage(
-        completion_tokens=10, prompt_tokens=6287, total_tokens=6297
-    )
+        completion_tokens=10, prompt_tokens=6299, total_tokens=6309)
 
     message = choice.message
     message = chat_completion.choices[0].message
@@ -227,34 +206,58 @@ async def test_single_chat_session_video_base64encoded(
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
 @pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
 async def test_single_chat_session_video_base64encoded_beamsearch(
-    client: openai.AsyncOpenAI,
-    model_name: str,
-    video_url: str,
-    url_encoded_video: dict[str, str],
-):
-    messages = dummy_messages_from_video_url(url_encoded_video[video_url])
+        client: openai.AsyncOpenAI, model_name: str, video_url: str,
+        base64_encoded_video: Dict[str, str]):
 
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url":
+                    f"data:video/jpeg;base64,{base64_encoded_video[video_url]}"
+                }
+            },
+            {
+                "type": "text",
+                "text": "What's in this video?"
+            },
+        ],
+    }]
     chat_completion = await client.chat.completions.create(
         model=model_name,
         messages=messages,
         n=2,
         max_completion_tokens=10,
-        extra_body=dict(use_beam_search=True),
-    )
+        extra_body=dict(use_beam_search=True))
     assert len(chat_completion.choices) == 2
-    assert (
-        chat_completion.choices[0].message.content
-        != chat_completion.choices[1].message.content
-    )
+    assert chat_completion.choices[
+        0].message.content != chat_completion.choices[1].message.content
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
 @pytest.mark.parametrize("video_url", TEST_VIDEO_URLS)
-async def test_chat_streaming_video(
-    client: openai.AsyncOpenAI, model_name: str, video_url: str
-):
-    messages = dummy_messages_from_video_url(video_url)
+async def test_chat_streaming_video(client: openai.AsyncOpenAI,
+                                    model_name: str, video_url: str):
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": video_url
+                }
+            },
+            {
+                "type": "text",
+                "text": "What's in this video?"
+            },
+        ],
+    }]
 
     # test single completion
     chat_completion = await client.chat.completions.create(
@@ -274,7 +277,7 @@ async def test_chat_streaming_video(
         temperature=0.0,
         stream=True,
     )
-    chunks: list[str] = []
+    chunks: List[str] = []
     finish_reason_count = 0
     async for chunk in stream:
         delta = chunk.choices[0].delta
@@ -294,17 +297,27 @@ async def test_chat_streaming_video(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model_name", [MODEL_NAME])
 @pytest.mark.parametrize(
-    "video_urls", [TEST_VIDEO_URLS[:i] for i in range(2, len(TEST_VIDEO_URLS))]
-)
-@pytest.mark.flaky(
-    reruns=2,
-    reruns_delay=5,
-    condition=current_platform.is_rocm(),
-)
-async def test_multi_video_input(
-    client: openai.AsyncOpenAI, model_name: str, video_urls: list[str]
-):
-    messages = dummy_messages_from_video_url(video_urls)
+    "video_urls",
+    [TEST_VIDEO_URLS[:i] for i in range(2, len(TEST_VIDEO_URLS))])
+async def test_multi_video_input(client: openai.AsyncOpenAI, model_name: str,
+                                 video_urls: List[str]):
+
+    messages = [{
+        "role":
+        "user",
+        "content": [
+            *({
+                "type": "video_url",
+                "video_url": {
+                    "url": video_url
+                }
+            } for video_url in video_urls),
+            {
+                "type": "text",
+                "text": "What's in this video?"
+            },
+        ],
+    }]
 
     if len(video_urls) > MAXIMUM_VIDEOS:
         with pytest.raises(openai.BadRequestError):  # test multi-video input

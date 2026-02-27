@@ -1,20 +1,19 @@
-# Benchmarks
+# Benchmarking vLLM
 
-This directory used to contain vLLM's benchmark scripts and utilities for performance testing and evaluation.
+## Downloading the ShareGPT dataset
 
-## Contents
+You can download the dataset by running:
+```bash
+wget https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json
+```
 
-- **Serving benchmarks**: Scripts for testing online inference performance (latency, throughput)
-- **Throughput benchmarks**: Scripts for testing offline batch inference performance
-- **Specialized benchmarks**: Tools for testing specific features like structured output, prefix caching, long document QA, request prioritization, and multi-modal inference
-- **Dataset utilities**: Framework for loading and sampling from various benchmark datasets (ShareGPT, HuggingFace datasets, synthetic data, etc.)
+## Downloading the ShareGPT4V dataset
 
-## Usage
-
-For detailed usage instructions, examples, and dataset information, see the [Benchmark CLI documentation](https://docs.vllm.ai/en/latest/benchmarking/cli/#benchmark-cli).
-
-For full CLI reference see:
-
-- <https://docs.vllm.ai/en/latest/cli/bench/latency.html>
-- <https://docs.vllm.ai/en/latest/cli/bench/serve.html>
-- <https://docs.vllm.ai/en/latest/cli/bench/throughput.html>
+The json file refers to several image datasets (coco, llava, etc.). The benchmark scripts
+will ignore a datapoint if the referred image is missing.
+```bash
+wget https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/resolve/main/sharegpt4v_instruct_gpt4-vision_cap100k.json
+mkdir coco -p
+wget http://images.cocodataset.org/zips/train2017.zip -O coco/train2017.zip
+unzip coco/train2017.zip -d coco/
+```

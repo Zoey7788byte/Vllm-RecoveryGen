@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
 # Copyright 2023 The vLLM team.
@@ -23,48 +20,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only PhiMoE model."""
-
-from collections.abc import Iterable
-from itertools import islice
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
+from vllm.attention import Attention, AttentionMetadata
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE
-from vllm.model_executor.layers.linear import (
-    QKVParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import (QKVParallelLinear,
+                                               ReplicatedLinear,
+                                               RowParallelLinear)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig)
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.sampler import SamplerOutput, get_sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
+    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import (
-    default_weight_loader,
-    maybe_remap_kv_scale_name,
-)
+    default_weight_loader, maybe_remap_kv_scale_name)
+from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
-from .utils import (
-    AutoWeightsLoader,
-    is_pp_missing_parameter,
-    make_empty_intermediate_tensors_factory,
-    make_layers,
-    maybe_prefix,
-)
+from .utils import (is_pp_missing_parameter,
+                    make_empty_intermediate_tensors_factory, make_layers,
+                    maybe_prefix)
 
 
 class PhiMoEConfig(PretrainedConfig):
+
     model_type = "phimoe"
     keys_to_ignore_at_inference = ["past_key_values"]
 
@@ -76,7 +65,6 @@ class PhiMoEConfig(PretrainedConfig):
         num_hidden_layers=32,
         num_attention_heads=32,
         num_key_value_heads=8,
-        head_dim=None,
         hidden_act="silu",
         max_position_embeddings=4096 * 32,
         initializer_range=0.02,
@@ -86,7 +74,7 @@ class PhiMoEConfig(PretrainedConfig):
         bos_token_id=1,
         eos_token_id=2,
         tie_word_embeddings=False,
-        rope_parameters=None,
+        rope_theta=1e6,
         sliding_window=None,
         attention_dropout=0.0,
         num_experts_per_tok=2,
@@ -110,18 +98,13 @@ class PhiMoEConfig(PretrainedConfig):
         # for backward compatibility
         if num_key_value_heads is None:
             num_key_value_heads = num_attention_heads
-        if head_dim is None:
-            head_dim = hidden_size // num_attention_heads
 
         self.num_key_value_heads = num_key_value_heads
-        self.head_dim = head_dim
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
         self.use_cache = use_cache
-        if rope_parameters is None:
-            rope_theta = kwargs.pop("rope_theta", 1e6)
-            rope_parameters = {"rope_type": "default", "rope_theta": rope_theta}
+        self.rope_theta = rope_theta
         self.attention_dropout = attention_dropout
 
         self.num_experts_per_tok = num_experts_per_tok
@@ -139,6 +122,7 @@ class PhiMoEConfig(PretrainedConfig):
 
 
 class mp(torch.autograd.Function):
+
     @staticmethod
     def forward(
         ctx,
@@ -160,15 +144,15 @@ class mp(torch.autograd.Function):
 
         grad_at_output = grad_at_output * multiplier
 
-        grad_at_scores_expanded = masked_gates * grad_at_output.mul(-1)
-        grad_at_scores_expanded.scatter_add_(
+        grad_at_scores_expaned = masked_gates * grad_at_output.mul(-1)
+        grad_at_scores_expaned.scatter_add_(
             dim=-1,
             index=selected_experts,
             src=grad_at_output,
         )
 
         return (
-            grad_at_scores_expanded,
+            grad_at_scores_expaned,
             None,
             None,
             None,
@@ -183,9 +167,8 @@ def sparsemixer(scores, jitter_eps=0.01):
         # compute mask for sparsity
         mask_logits_threshold, max_ind = scores.max(dim=-1, keepdim=True)
         factor = scores.abs().clamp(min=mask_logits_threshold)
-        mask_logits_threshold = ((mask_logits_threshold - scores) / factor) > (
-            2 * jitter_eps
-        )
+        mask_logits_threshold = (
+            (mask_logits_threshold - scores) / factor) > (2 * jitter_eps)
 
     # apply mask
     masked_gates = scores.masked_fill(mask_logits_threshold, float("-inf"))
@@ -206,21 +189,24 @@ def sparsemixer(scores, jitter_eps=0.01):
     )
     with torch.no_grad():
         # compute mask for sparsity
-        mask_logits_threshold, max_ind = masked_scores.max(dim=-1, keepdim=True)
+        mask_logits_threshold, max_ind = masked_scores.max(dim=-1,
+                                                           keepdim=True)
         factor = scores.abs().clamp(min=mask_logits_threshold)
-        mask_logits_threshold = ((mask_logits_threshold - scores) / factor) > (
-            2 * jitter_eps
-        )
+        mask_logits_threshold = (
+            (mask_logits_threshold - scores) / factor) > (2 * jitter_eps)
 
     # apply mask
-    masked_gates_top2 = masked_scores.masked_fill(mask_logits_threshold, float("-inf"))
+    masked_gates_top2 = masked_scores.masked_fill(mask_logits_threshold,
+                                                  float("-inf"))
     selected_experts_top2 = max_ind
     # compute scores for gradients
     masked_gates_top2 = torch.softmax(masked_gates_top2, dim=-1)
-    multiplier_top2 = masked_gates_top2.gather(dim=-1, index=selected_experts_top2)
+    multiplier_top2 = masked_gates_top2.gather(dim=-1,
+                                               index=selected_experts_top2)
 
     multiplier = torch.concat((multiplier, multiplier_top2), dim=-1)
-    selected_experts = torch.concat((selected_experts, selected_experts_top2), dim=-1)
+    selected_experts = torch.concat((selected_experts, selected_experts_top2),
+                                    dim=-1)
 
     return (
         multiplier,
@@ -234,7 +220,8 @@ def phimoe_routing_function(
     topk: int,
     renormalize: bool,
 ):
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert hidden_states.shape[0] == gating_output.shape[0], (
+        "Number of tokens mismatch")
     assert topk == 2, "Only top-2 routing is supported"
     assert renormalize is False, "Renormalization is not supported"
 
@@ -257,10 +244,9 @@ class PhiMoE(nn.Module):
         top_k: int,
         hidden_size: int,
         intermediate_size: int,
-        params_dtype: torch.dtype | None = None,
-        quant_config: QuantizationConfig | None = None,
-        tp_size: int | None = None,
-        prefix: str = "",
+        params_dtype: Optional[torch.dtype] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_size: Optional[int] = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -272,7 +258,6 @@ class PhiMoE(nn.Module):
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
-            prefix=f"{prefix}.gate",
         )
 
         self.experts = FusedMoE(
@@ -285,9 +270,7 @@ class PhiMoE(nn.Module):
             renormalize=False,
             quant_config=quant_config,
             tp_size=tp_size,
-            custom_routing_function=phimoe_routing_function,
-            prefix=f"{prefix}.experts",
-        )
+            custom_routing_function=phimoe_routing_function)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # NOTE: hidden_states can have either 1D or 2D shape.
@@ -300,16 +283,17 @@ class PhiMoE(nn.Module):
 
 
 class PhiMoEAttention(nn.Module):
+
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_parameters: dict,
-        head_dim: int | None = None,
         max_position: int = 4096 * 32,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
+        rope_theta: float = 10000,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
+        rope_scaling: Optional[dict] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -328,12 +312,12 @@ class PhiMoEAttention(nn.Module):
             # the KV heads across multiple tensor parallel GPUs.
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
-        if head_dim is None:
-            head_dim = hidden_size // num_heads
-        self.head_dim = head_dim
+        self.head_dim = hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.rope_scaling = rope_scaling
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -342,20 +326,20 @@ class PhiMoEAttention(nn.Module):
             self.total_num_kv_heads,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=True,
             quant_config=quant_config,
-            prefix=f"{prefix}.o_proj",
         )
         self.rotary_emb = get_rope(
             self.head_dim,
+            rotary_dim=self.head_dim,
             max_position=max_position,
-            rope_parameters=rope_parameters,
+            base=int(self.rope_theta),
             is_neox_style=True,
+            rope_scaling=self.rope_scaling,
         )
         self.attn = Attention(
             self.num_heads,
@@ -371,37 +355,39 @@ class PhiMoEAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         output, _ = self.o_proj(attn_output)
         return output
 
 
 class PhiMoEDecoderLayer(nn.Module):
+
     def __init__(
         self,
         config: PhiMoEConfig,
-        cache_config: CacheConfig | None = None,
-        quant_config: QuantizationConfig | None = None,
+        cache_config: Optional[CacheConfig] = None,
+        quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         # Requires transformers > 4.32.0
+        rope_theta = getattr(config, "rope_theta", 10000)
         self.self_attn = PhiMoEAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
             max_position=config.max_position_embeddings,
             num_kv_heads=config.num_key_value_heads,
-            head_dim=getattr(
-                config, "head_dim", self.hidden_size // config.num_attention_heads
-            ),
+            rope_theta=rope_theta,
             cache_config=cache_config,
             quant_config=quant_config,
-            rope_parameters=config.rope_parameters,
+            rope_scaling=config.rope_scaling,
             prefix=f"{prefix}.self_attn",
         )
         self.block_sparse_moe = PhiMoE(
@@ -410,20 +396,21 @@ class PhiMoEDecoderLayer(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             quant_config=quant_config,
-            prefix=f"{prefix}.block_sparse_moe",
         )
-        self.input_layernorm = nn.LayerNorm(
-            config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True
-        )
-        self.post_attention_layernorm = nn.LayerNorm(
-            config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True
-        )
+        self.input_layernorm = nn.LayerNorm(config.hidden_size,
+                                            eps=config.rms_norm_eps,
+                                            elementwise_affine=True)
+        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size,
+                                                     eps=config.rms_norm_eps,
+                                                     elementwise_affine=True)
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
         residual = hidden_states
 
@@ -433,6 +420,8 @@ class PhiMoEDecoderLayer(nn.Module):
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
         )
         hidden_states = hidden_states + residual
 
@@ -447,83 +436,174 @@ class PhiMoEDecoderLayer(nn.Module):
 
 @support_torch_compile
 class PhiMoEModel(nn.Module):
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        lora_config = vllm_config.lora_config
 
-        self.vocab_size = config.vocab_size
-
-        self.config = config
-        self.quant_config = quant_config
+        self.padding_idx = config.pad_token_id
+        lora_vocab = ((lora_config.lora_extra_vocab_size *
+                       (lora_config.max_loras or 1)) if lora_config else 0)
+        self.vocab_size = config.vocab_size + lora_vocab
+        self.org_vocab_size = config.vocab_size
 
         self.embed_tokens = VocabParallelEmbedding(
             self.vocab_size,
             config.hidden_size,
+            org_num_embeddings=config.vocab_size,
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: PhiMoEDecoderLayer(
-                config, cache_config, quant_config, prefix=prefix
-            ),
-            prefix=f"{prefix}.layers",
-        )
-        self.norm = nn.LayerNorm(
-            config.hidden_size, eps=config.rms_norm_eps, elementwise_affine=True
-        )
+                config, cache_config, quant_config, prefix=prefix),
+            prefix=f"{prefix}.layers")
+        self.norm = nn.LayerNorm(config.hidden_size,
+                                 eps=config.rms_norm_eps,
+                                 elementwise_affine=True)
 
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], config.hidden_size
-        )
+        self.make_empty_intermediate_tensors = (
+            make_empty_intermediate_tensors_factory(
+                ["hidden_states", "residual"], config.hidden_size))
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor | None,
+        input_ids: torch.Tensor,
         positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors],
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
-                hidden_states = self.embed_input_ids(input_ids)
+                hidden_states = self.get_input_embeddings(input_ids)
             residual = None
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
+                kv_caches[i - self.start_layer],
+                attn_metadata,
                 residual,
             )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
-            )
+            return IntermediateTensors({
+                "hidden_states": hidden_states,
+                "residual": residual
+            })
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return FusedMoE.make_expert_params_mapping(
-            self,
-            ckpt_gate_proj_name="w1",
-            ckpt_down_proj_name="w2",
-            ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
-        )
 
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+class PhiMoEForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+    fall_back_to_pt_during_load = False
+
+    packed_modules_mapping = {
+        "qkv_proj": [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+        ],
+    }
+
+    # LoRA specific attributes
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "embed_tokens",
+        "lm_head",
+        "w1",
+        "w2",
+        "w3",
+        "gate",
+    ]
+    embedding_modules = {
+        "embed_tokens": "input_embeddings",
+        "lm_head": "output_embeddings",
+    }
+    embedding_padding_modules = ["lm_head"]
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        super().__init__()
+        config = vllm_config.model_config.hf_config
+        lora_config = vllm_config.lora_config
+        self.config = config
+        self.lora_config = lora_config
+
+        self.model = PhiMoEModel(vllm_config=vllm_config,
+                                 prefix=maybe_prefix(prefix, "model"))
+        self.unpadded_vocab_size = config.vocab_size
+        if lora_config:
+            self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
+        self.lm_head = ParallelLMHead(
+            self.unpadded_vocab_size,
+            config.hidden_size,
+            org_num_embeddings=config.vocab_size,
+            padding_size=(
+                DEFAULT_VOCAB_PADDING_SIZE
+                # We need bigger padding if using lora for kernel
+                # compatibility
+                if not lora_config else lora_config.lora_vocab_padding_size),
+            quant_config=None,
+            bias=True,
+        )
+        self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
+                                                config.vocab_size)
+        self.sampler = get_sampler()
+
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors)
+
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.model.get_input_embeddings(input_ids)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        intermediate_tensors: Optional[IntermediateTensors] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, IntermediateTensors]:
+        hidden_states = self.model(input_ids, positions, kv_caches,
+                                   attn_metadata, intermediate_tensors,
+                                   inputs_embeds)
+        return hidden_states
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head, hidden_states,
+                                       sampling_metadata)
+        return logits
+
+    def sample(
+        self,
+        logits: Optional[torch.Tensor],
+        sampling_metadata: SamplingMetadata,
+    ) -> Optional[SamplerOutput]:
+        next_tokens = self.sampler(logits, sampling_metadata)
+        return next_tokens
+
+    def load_weights(self, weights: Iterable[Tuple[str,
+                                                   torch.Tensor]]) -> Set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -531,21 +611,16 @@ class PhiMoEModel(nn.Module):
             ("qkv_proj", "v_proj", "v"),
         ]
 
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="w1",
+            ckpt_down_proj_name="w2",
+            ckpt_up_proj_name="w3",
+            num_experts=self.config.num_local_experts)
+
         params_dict = dict(self.named_parameters())
-        loaded_params: set[str] = set()
-        expert_params_mapping = self.get_expert_mapping()
+        loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
-            if self.quant_config is not None and (
-                scale_name := self.quant_config.get_cache_scale(name)
-            ):
-                # Loading kv cache quantization scales
-                param = params_dict[scale_name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = (
-                    loaded_weight if loaded_weight.dim() == 0 else loaded_weight[0]
-                )
-                weight_loader(param, loaded_weight)
-                loaded_params.add(scale_name)
+            if "rotary_emb.inv_freq" in name:
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -594,78 +669,8 @@ class PhiMoEModel(nn.Module):
                         continue
 
                     param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-
-class PhiMoEForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
-    fall_back_to_pt_during_load = False
-
-    packed_modules_mapping = {
-        "qkv_proj": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-        ],
-    }
-
-    # LoRA specific attributes
-    embedding_modules = {
-        "embed_tokens": "input_embeddings",
-        "lm_head": "output_embeddings",
-    }
-
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
-        super().__init__()
-        config = vllm_config.model_config.hf_config
-
-        self.config = config
-
-        self.quant_config = vllm_config.quant_config
-
-        self.model = PhiMoEModel(
-            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
-        )
-
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=None,
-            bias=True,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
-        self.logits_processor = LogitsProcessor(config.vocab_size)
-
-        self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors
-        )
-
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)
-
-    def forward(
-        self,
-        input_ids: torch.Tensor | None,
-        positions: torch.Tensor,
-        intermediate_tensors: IntermediateTensors | None = None,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-        return hidden_states
-
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        logits = self.logits_processor(self.lm_head, hidden_states)
-        return logits
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
-
-    def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return self.model.get_expert_mapping()

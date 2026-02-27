@@ -24,14 +24,19 @@
 
 #include "attention_dtypes.h"
 #include "attention_utils.cuh"
-#include "../cuda_compat.h"
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
-  #include "../quantization/w8a8/fp8/amd/quant_utils.cuh"
+  #include "../quantization/fp8/amd/quant_utils.cuh"
 typedef __hip_bfloat16 __nv_bfloat16;
 #else
-  #include "../quantization/w8a8/fp8/nvidia/quant_utils.cuh"
+  #include "../quantization/fp8/nvidia/quant_utils.cuh"
+#endif
+
+#ifndef USE_ROCM
+  #define WARP_SIZE 32
+#else
+  #define WARP_SIZE warpSize
 #endif
 
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
@@ -100,7 +105,7 @@ __device__ void paged_attention_kernel(
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
-    const float* k_scale, const float* v_scale, const int tp_rank,
+    const float k_scale, const float v_scale, const int tp_rank,
     const int blocksparse_local_blocks, const int blocksparse_vert_stride,
     const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
   const int seq_idx = blockIdx.y;
@@ -167,7 +172,7 @@ __device__ void paged_attention_kernel(
 
   // Load the query to registers.
   // Each thread in a thread group has a different part of the query.
-  // For example, if the thread group size is 4, then the first thread in
+  // For example, if the the thread group size is 4, then the first thread in
   // the group has 0, 4, 8, ... th vectors of the query, and the second thread
   // has 1, 5, 9, ... th vectors of the query, and so on. NOTE(woosuk): Because
   // q is split from a qkv tensor, it may not be contiguous.
@@ -254,7 +259,7 @@ __device__ void paged_attention_kernel(
 
     // Load a key to registers.
     // Each thread in a thread group has a different part of the key.
-    // For example, if the thread group size is 4, then the first thread in
+    // For example, if the the thread group size is 4, then the first thread in
     // the group has 0, 4, 8, ... th vectors of the key, and the second thread
     // has 1, 5, 9, ... th vectors of the key, and so on.
     for (int i = 0; i < NUM_TOKENS_PER_THREAD_GROUP; i++) {
@@ -280,7 +285,7 @@ __device__ void paged_attention_kernel(
           Quant_vec k_vec_quant = *reinterpret_cast<const Quant_vec*>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
           k_vecs[j] = fp8::scaled_convert<K_vec, Quant_vec, KV_DTYPE>(
-              k_vec_quant, *k_scale);
+              k_vec_quant, k_scale);
         }
       }
 
@@ -410,7 +415,7 @@ __device__ void paged_attention_kernel(
               *reinterpret_cast<const V_quant_vec*>(v_ptr + offset);
           // Vector conversion from V_quant_vec to V_vec.
           v_vec = fp8::scaled_convert<V_vec, V_quant_vec, KV_DTYPE>(v_quant_vec,
-                                                                    *v_scale);
+                                                                    v_scale);
         }
         if (block_idx == num_seq_blocks - 1) {
           // NOTE(woosuk): When v_vec contains the tokens that are out of the
@@ -508,7 +513,7 @@ __global__ void paged_attention_v1_kernel(
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
-    const float* k_scale, const float* v_scale, const int tp_rank,
+    const float k_scale, const float v_scale, const int tp_rank,
     const int blocksparse_local_blocks, const int blocksparse_vert_stride,
     const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
@@ -544,7 +549,7 @@ __global__ void paged_attention_v2_kernel(
     const int max_num_blocks_per_seq,
     const float* __restrict__ alibi_slopes,  // [num_heads]
     const int q_stride, const int kv_block_stride, const int kv_head_stride,
-    const float* k_scale, const float* v_scale, const int tp_rank,
+    const float k_scale, const float v_scale, const int tp_rank,
     const int blocksparse_local_blocks, const int blocksparse_vert_stride,
     const int blocksparse_block_size, const int blocksparse_head_sliding_step) {
   paged_attention_kernel<scalar_t, cache_t, HEAD_SIZE, BLOCK_SIZE, NUM_THREADS,
@@ -665,6 +670,7 @@ __global__ void paged_attention_v2_reduce_kernel(
 
 }  // namespace vllm
 
+#undef WARP_SIZE
 #undef MAX
 #undef MIN
 #undef DIVIDE_ROUND_UP

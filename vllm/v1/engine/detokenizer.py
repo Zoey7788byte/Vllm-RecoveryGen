@@ -1,163 +1,187 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
-import tokenizers
-from packaging import version
-from tokenizers import Tokenizer
-from tokenizers.decoders import DecodeStream
-from transformers import PreTrainedTokenizerFast
-
+from vllm.engine.output_processor.stop_checker import StopChecker
 from vllm.logger import init_logger
-from vllm.tokenizers import TokenizerLike
-from vllm.tokenizers.detokenizer_utils import (
-    convert_prompt_ids_to_tokens,
-    detokenize_incrementally,
-)
-from vllm.utils import length_from_prompt_token_ids_or_embeds
-from vllm.v1.engine import EngineCoreRequest
+from vllm.outputs import RequestOutput
+from vllm.sampling_params import RequestOutputKind
+from vllm.transformers_utils.detokenizer_utils import (
+    AnyTokenizer, convert_prompt_ids_to_tokens, detokenize_incrementally)
+from vllm.transformers_utils.tokenizer import get_tokenizer
+from vllm.v1.engine import DetokenizerRequest, EngineCoreOutput
 
 logger = init_logger(__name__)
 
-# Only tokenizers >= 0.22.0 supports DecodeStream with native prefill
-# (ids parameter) used for FastIncrementalDetokenizer.
-USE_FAST_DETOKENIZER = version.parse(tokenizers.__version__) >= version.parse("0.22.0")
 
-# Error string from https://github.com/huggingface/tokenizers/blob/909fdde2a4ffedd9295206f705eb612be2a91b12/tokenizers/src/tokenizer/mod.rs#L1042
-INVALID_PREFIX_ERR_MSG = "Invalid prefix encountered"
-
-
+@dataclass
 class IncrementalDetokenizer:
-    def __init__(self):
-        self.token_ids: list[int] = []
+
+    # Generation data
+    output_text: str
+    tokens: List[str]
+    token_ids: List[int]
+
+    # Stop strings
+    stop: List[str]
+    include_stop_str_in_output: bool
+
+    # Metadata for incremental detokenization
+    prefix_offset: int
+    read_offset: int
+
+    # Parameters for detokenization
+    skip_special_tokens: bool
+    spaces_between_special_tokens: bool
+    output_kind: RequestOutputKind
+
+    # TODO: Probably decouple these
+    request_id: str
+    prompt: Optional[str]
+    prompt_token_ids: List[int]
+
+    # Tokenizer for this request
+    tokenizer: AnyTokenizer
+
+    # Accounting for stop string buffering
+    stop_buffer_length: int
+    _last_output_text_offset: int = 0
 
     @property
-    def output_token_ids(self) -> list[int]:
-        return self.token_ids
-
-    def num_output_tokens(self) -> int:
-        return len(self.token_ids)
-
-    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
-        self.token_ids.extend(new_token_ids)
-        return None
-
-    def get_next_output_text(self, finished: bool, delta: bool) -> str:
-        return ""
+    def output_token_ids(self) -> List[int]:
+        assert len(self.token_ids) >= len(self.prompt_token_ids)
+        return self.token_ids[len(self.prompt_token_ids):]
 
     @classmethod
     def from_new_request(
         cls,
-        tokenizer: TokenizerLike | None,
-        request: EngineCoreRequest,
+        tokenizer: AnyTokenizer,
+        request: DetokenizerRequest,
     ) -> "IncrementalDetokenizer":
-        assert request.sampling_params is not None
 
-        if tokenizer is None:
-            # No tokenizer => skipping detokenization.
-            return IncrementalDetokenizer()
+        tokens, prefix_offset, read_offset = convert_prompt_ids_to_tokens(
+            tokenizer=tokenizer,
+            prompt_ids=request.prompt_token_ids,
+            skip_special_tokens=request.skip_special_tokens,
+        )
 
-        if USE_FAST_DETOKENIZER and isinstance(tokenizer, PreTrainedTokenizerFast):
-            # Fast tokenizer => use tokenizers library DecodeStream.
-            return FastIncrementalDetokenizer(tokenizer, request)
-
-        # Fall back to slow python-based incremental detokenization.
-        return SlowIncrementalDetokenizer(tokenizer, request)
-
-
-class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
-    def __init__(self, request: EngineCoreRequest):
-        super().__init__()
-
-        # Stop strings
-        params = request.sampling_params
-        assert params is not None
-        stop_list: list[str]
-        if params.stop is None:
-            stop_list = []
-        elif isinstance(params.stop, str):
-            stop_list = [params.stop]
-        else:
-            stop_list = params.stop
-        self.stop = stop_list
-        self.min_tokens = params.min_tokens
-        self.include_stop_str_in_output = params.include_stop_str_in_output
-
+        stops = request.stop
         # Number of chars to hold back when stop strings are to be excluded
         # from streamed output.
-        if self.stop and not self.include_stop_str_in_output:
-            self.stop_buffer_length = max(len(s) for s in self.stop) - 1
+        if stops and not request.include_stop_str_in_output:
+            stop_buffer_length = max(len(s) for s in stops) - 1
         else:
-            self.stop_buffer_length = 0
-        self._last_output_text_offset: int = 0
+            stop_buffer_length = 0
 
-        # Generation data
-        self.output_text = ""
+        return cls(
+            output_text="",
+            tokens=tokens,
+            # Detokenizer mutates this list, so need a unique copy.
+            # NOTE(Nick): could we take ownership of it though?
+            token_ids=request.prompt_token_ids.copy(),
+            stop=stops,
+            include_stop_str_in_output=request.include_stop_str_in_output,
+            prefix_offset=prefix_offset,
+            read_offset=read_offset,
+            skip_special_tokens=request.skip_special_tokens,
+            spaces_between_special_tokens=request.
+            spaces_between_special_tokens,
+            output_kind=request.output_kind,
+            request_id=request.request_id,
+            prompt=request.prompt,
+            prompt_token_ids=request.prompt_token_ids,
+            tokenizer=tokenizer,
+            stop_buffer_length=stop_buffer_length,
+        )
 
-    def update(self, new_token_ids: list[int], stop_terminated: bool) -> str | None:
+    def add_tokens(
+        self,
+        new_token_ids: List[int],
+        finish_reason: Optional[str],
+        stop_reason: Optional[Union[int, str, None]],
+    ) -> Optional[RequestOutput]:
         """
         Update RequestState for the request_id by:
             1) Detokenize the new token ids incrementally.
-            2) Evaluate stop criteria.
-
-        Return matched stop string or None.
+            2) Update the RequestOutput with the new text.
         """
-        if not new_token_ids:
-            # Skip detokenization if no new token ids.
-            return None
-
-        if stop_terminated and not self.include_stop_str_in_output:
-            # If stop-terminated, exclude last token from detokenization
-            # based on include_stop_str_in_output parameter.
-            skipped_stop_token_id = new_token_ids[-1]
-            new_token_ids = new_token_ids[:-1]
-        else:
-            skipped_stop_token_id = None
 
         # 1) Detokenize the new token ids incrementally.
-        stop_check_offset = len(self.output_text)
+        # TODO(woosuk): This method becomes very inefficient when the number of
+        # new_token_ids is more than 1. We need to optimize this.
+        decoded_text = ""
         for new_token_id in new_token_ids:
             self.token_ids.append(new_token_id)
-            self.output_text += self.decode_next(new_token_id)
-            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
-            if self.min_tokens and self.num_output_tokens() <= self.min_tokens:
-                stop_check_offset = len(self.output_text)
+            (new_tokens, new_decoded_token_text, prefix_offset,
+             read_offset) = detokenize_incrementally(
+                 tokenizer=self.tokenizer,
+                 all_input_ids=self.token_ids,
+                 prev_tokens=self.tokens,
+                 prefix_offset=self.prefix_offset,
+                 read_offset=self.read_offset,
+                 skip_special_tokens=self.skip_special_tokens,
+                 spaces_between_special_tokens=self.
+                 spaces_between_special_tokens,
+             )
 
-        if skipped_stop_token_id is not None:
-            # Cleanup after skipping detokenization.
-            self.token_ids.append(skipped_stop_token_id)
+            self.tokens.extend(new_tokens)
+            self.prefix_offset = prefix_offset
+            self.read_offset = read_offset
+            self.output_text += new_decoded_token_text
 
-        # 2) Evaluate stop strings.
-        stop_string = None
-        if self.stop and self.num_output_tokens() > self.min_tokens:
-            stop = check_stop_strings(
+            decoded_text += new_decoded_token_text
+
+        # 2) Evaluate stop criteria.
+        if self.stop:
+            stop = StopChecker.check_stop_strings(
                 output_text=self.output_text,
-                new_char_count=len(self.output_text) - stop_check_offset,
+                new_char_count=len(decoded_text),
                 stop=self.stop,
                 include_in_output=self.include_stop_str_in_output,
             )
             if stop is not None:
-                stop_string, truncate_to = stop
+                stop_str, truncate_to = stop
                 if truncate_to != -1:
                     self.output_text = self.output_text[:truncate_to]
+                finish_reason = "stop"  # TODO: use constant
+                stop_reason = stop_str
 
-        return stop_string
+        # TODO: handle stop_token_ids here too?
 
-    @abstractmethod
-    def decode_next(self, next_token_id: int) -> str:
-        raise NotImplementedError
+        # 3) Update the RequestOutput object with the new text.
+        finished = bool(finish_reason)
+        if self.output_kind == RequestOutputKind.FINAL_ONLY \
+            and not finished:
+            return None
 
-    def get_next_output_text(self, finished: bool, delta: bool) -> str:
+        delta = self.output_kind == RequestOutputKind.DELTA
+        output_text = self._get_next_output_text(finished, delta)
+        token_ids = new_token_ids if delta else self.output_token_ids
+
+        request_output = RequestOutput.new(
+            self.request_id,
+            self.prompt,
+            self.prompt_token_ids,
+            output_text,
+            token_ids,
+            finished,
+        )
+
+        if finished:
+            completion_output = request_output.outputs[0]
+            completion_output.finish_reason = finish_reason
+            completion_output.stop_reason = stop_reason
+
+        return request_output
+
+    def _get_next_output_text(self, finished: bool, delta: bool) -> str:
         """If delta is True, only new text since the last call to
         this method is returned"""
 
         # We return the full output text if the sequence is finished.
         buffer_length = 0 if finished else self.stop_buffer_length
         if not delta:
-            if not buffer_length:
-                return self.output_text
-            return self.output_text[:-buffer_length]
-
+            return self.output_text[:-buffer_length] if buffer_length else (
+                self.output_text)
         length = len(self.output_text) - buffer_length
         last_offset = self._last_output_text_offset
         if last_offset < length:
@@ -166,176 +190,83 @@ class BaseIncrementalDetokenizer(IncrementalDetokenizer, ABC):
         return ""
 
 
-class FastIncrementalDetokenizer(BaseIncrementalDetokenizer):
-    def __init__(self, tokenizer: PreTrainedTokenizerFast, request: EngineCoreRequest):
-        super().__init__(request)
+class Detokenizer:
 
-        sampling_params = request.sampling_params
-        assert sampling_params is not None
+    def __init__(self,
+                 tokenizer_name: str,
+                 tokenizer_mode: str = "auto",
+                 trust_remote_code: bool = False,
+                 revision: Optional[str] = None):
+        # TODO: once we support LoRA, we should should pass the tokenizer
+        # here. We currently have two copies (this + in the LLMEngine).
+        self.tokenizer = get_tokenizer(tokenizer_name=tokenizer_name,
+                                       tokenizer_mode=tokenizer_mode,
+                                       trust_remote_code=trust_remote_code,
+                                       revision=revision)
 
-        self.request_id = request.request_id
-        self.skip_special_tokens = sampling_params.skip_special_tokens
+        # Request id -> IncrementalDetokenizer
+        self.request_states: Dict[str, IncrementalDetokenizer] = {}
 
-        self.tokenizer: Tokenizer = tokenizer._tokenizer
+    def is_request_active(self, request_id: str):
+        return request_id in self.request_states
 
-        # Use native prefill to prime the decode stream with prompt tokens.
-        self.stream = DecodeStream(
-            ids=request.prompt_token_ids,
-            skip_special_tokens=self.skip_special_tokens,
-        )
+    def get_num_unfinished_requests(self):
+        return len(self.request_states)
 
-        self.spaces_between_special_tokens = (
-            sampling_params.skip_special_tokens
-            or sampling_params.spaces_between_special_tokens
-        )
+    def has_unfinished_requests(self) -> bool:
+        return len(self.request_states) > 0
 
-        if not self.spaces_between_special_tokens:
-            # Store dict of added token ids so that we can suppress
-            # the spaces between them.
-            added_token_ids = getattr(self.tokenizer, "added_token_ids", None)
-            if added_token_ids is None:
-                self.tokenizer.added_token_ids = added_token_ids = {
-                    tid: tok.content
-                    for tid, tok in self.tokenizer.get_added_tokens_decoder().items()
-                }
+    def abort_requests(
+        self,
+        request_ids: Iterable[str],
+    ) -> None:
+        """Remove the request_ids from the Detokenizer."""
 
-            if added_token_ids:
-                self.last_special = False
-                self.added_token_ids = added_token_ids
-            else:
-                # No added tokens.
-                self.spaces_between_special_tokens = True
+        for request_id in request_ids:
+            self.request_states.pop(request_id, None)
 
-    def decode_next(self, next_token_id: int) -> str:
-        token = self._protected_step(next_token_id)
+    def add_request(
+        self,
+        request: DetokenizerRequest,
+    ):
+        """Add new request to the Detokenizer."""
 
-        if not self.spaces_between_special_tokens:
-            special_token = self.added_token_ids.get(next_token_id)
-            is_special = special_token is not None
-            if is_special and self.last_special:
-                # Return raw token string without any prefixed spaces.
-                token = special_token
-            self.last_special = is_special
+        assert (request.request_id not in self.request_states)
 
-        return token or ""
+        request_state = IncrementalDetokenizer.from_new_request(
+            self.tokenizer, request)
+        self.request_states[request.request_id] = request_state
 
-    def _protected_step(self, next_token_id: int) -> str | None:
-        try:
-            token = self.stream.step(self.tokenizer, next_token_id)
-        except (OverflowError, TypeError):
-            # Handle rare observed overflow, still to be diagnosed.
-            # See https://github.com/vllm-project/vllm/issues/21951.
-            logger.exception("Encountered invalid token id: %r", next_token_id)
-            token = None
-        except Exception as e:
-            if not str(e).startswith(INVALID_PREFIX_ERR_MSG):
-                raise e
-            # Recover from edge case where tokenizer can produce non-monotonic,
-            # invalid UTF-8 output, which breaks the internal state of
-            # tokenizers' DecodeStream.
-            # See https://github.com/vllm-project/vllm/issues/17448.
-            logger.warning(
-                "Encountered invalid prefix detokenization error"
-                " for request %s, resetting decode stream.",
-                self.request_id,
+    def step(
+        self, encore_core_outputs: List[EngineCoreOutput]
+    ) -> Tuple[List[RequestOutput], List[str]]:
+        """Update state and request the RequestOutputs to the LLMEngine."""
+
+        request_outputs: List[RequestOutput] = []
+        requests_to_abort: List[str] = []
+        for engine_core_output in encore_core_outputs:
+            request_id = engine_core_output.request_id
+            detokenizer = self.request_states.get(request_id)
+            if detokenizer is None:
+                # Ignore output for already-aborted request.
+                continue
+
+            # Detokenize and update state.
+            request_output = detokenizer.add_tokens(
+                new_token_ids=engine_core_output.new_token_ids,
+                finish_reason=engine_core_output.finish_reason,
+                stop_reason=engine_core_output.stop_reason,
             )
-            self.stream = DecodeStream(skip_special_tokens=self.skip_special_tokens)
-            token = self.stream.step(self.tokenizer, next_token_id)
-        return token
 
+            if request_output is not None:
+                # Add to RequestOutputs list.
+                request_outputs.append(request_output)
 
-class SlowIncrementalDetokenizer(BaseIncrementalDetokenizer):
-    def __init__(self, tokenizer: TokenizerLike, request: EngineCoreRequest):
-        super().__init__(request)
+                # Free completed requests.
+                if request_output.finished:
+                    self.request_states.pop(request_id)
+                    if not engine_core_output.finished:
+                        requests_to_abort.append(request_id)
 
-        self.tokenizer = tokenizer
-        params = request.sampling_params
-        assert params is not None
-
-        self.prompt_len = length_from_prompt_token_ids_or_embeds(
-            request.prompt_token_ids, request.prompt_embeds
-        )
-
-        # Metadata for incremental detokenization.
-        if request.prompt_token_ids is not None:
-            self.tokens, self.prefix_offset, self.read_offset = (
-                convert_prompt_ids_to_tokens(
-                    tokenizer=tokenizer,
-                    prompt_ids=request.prompt_token_ids,
-                    skip_special_tokens=params.skip_special_tokens,
-                )
-            )
-        else:
-            # Prompt embedding requests cannot be detokenized, in general.
-            self.tokens = [""] * self.prompt_len
-            self.prefix_offset = 0
-            self.read_offset = 0
-
-        self.token_ids.extend(request.prompt_token_ids or [0] * self.prompt_len)
-
-        self.skip_special_tokens = params.skip_special_tokens
-        self.spaces_between_special_tokens = params.spaces_between_special_tokens
-
-    @property
-    def output_token_ids(self) -> list[int]:
-        if self.prompt_len:
-            return self.token_ids[self.prompt_len :]
-        return self.token_ids
-
-    def num_output_tokens(self) -> int:
-        return len(self.token_ids) - self.prompt_len
-
-    def decode_next(self, next_token_id: int) -> str:
-        new_tokens, decoded_text, prefix_offset, read_offset = detokenize_incrementally(
-            tokenizer=self.tokenizer,
-            all_input_ids=self.token_ids,
-            prev_tokens=self.tokens,
-            prefix_offset=self.prefix_offset,
-            read_offset=self.read_offset,
-            skip_special_tokens=self.skip_special_tokens,
-            spaces_between_special_tokens=self.spaces_between_special_tokens,
-        )
-
-        self.tokens.extend(new_tokens)
-        self.prefix_offset = prefix_offset
-        self.read_offset = read_offset
-
-        return decoded_text
-
-
-def check_stop_strings(
-    output_text: str,
-    new_char_count: int,
-    stop: list[str],
-    include_in_output: bool,
-) -> tuple[str, int] | None:
-    """Check if any stop strings are matched and truncate sequence
-    output text accordingly.
-
-    Returns tuple (stop_string, offset) if matched or else None.
-
-    Where stop_string is the matched stop string and offset is the
-    length to which output_text should be truncated, or -1 for no
-    truncation.
-    """
-    if not new_char_count or not stop:
-        return None
-
-    for stop_str in stop:
-        stop_string_len = len(stop_str)
-        # Avoid searching already-searched text.
-        stop_index = output_text.find(stop_str, 1 - new_char_count - stop_string_len)
-        if stop_index == -1:
-            continue
-
-        if include_in_output:
-            # Truncate to end of stop string.
-            stop_index += stop_string_len
-            if stop_index >= len(output_text):
-                # No truncation required.
-                return stop_str, -1
-
-        # Truncate the output text to either the beginning
-        # or end of the stop string.
-        return stop_str, stop_index
-    return None
+        # Return to EngineClient.
+        return request_outputs, requests_to_abort

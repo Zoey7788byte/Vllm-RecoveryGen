@@ -68,7 +68,7 @@ struct ScaledEpilogueBase {
   // This overload handles the case where there might not be a tensor, in which
   // case a nullptr is passed and a constant (0) is used.
   template <typename Descriptor, typename T>
-  static auto args_from_tensor(std::optional<torch::Tensor> const& tensor) {
+  static auto args_from_tensor(c10::optional<torch::Tensor> const& tensor) {
     static_assert(std::is_same_v<Descriptor, RowOrZeroLoad<T>>);
     using Arguments = typename Descriptor::Arguments;
     auto* data_ptr = tensor ? static_cast<T*>(tensor->data_ptr()) : nullptr;
@@ -122,8 +122,8 @@ struct ScaledEpilogue
     auto a_args = SUPER::template args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
 
-    typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
-    return ArgumentType{a_args, evt0_args, {}};
+    typename EVTCompute0::Arguments evt0_args{b_args};
+    return ArgumentType{a_args, evt0_args};
   }
 };
 
@@ -153,7 +153,7 @@ struct ScaledEpilogueBias
       cutlass::epilogue::threadblock::Sm80EVT<Compute0, ScaleB, Accum>;
 
   using Compute1 = cutlass::epilogue::threadblock::VisitorCompute<
-      cutlass::homogeneous_multiply_add, ElementD, float,
+      cutlass::multiply_add, ElementD, float,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
  public:
@@ -167,8 +167,8 @@ struct ScaledEpilogueBias
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
     auto bias_args = SUPER::template args_from_tensor<Bias, ElementD>(bias);
 
-    typename EVTCompute0::Arguments evt0_args{b_args, {}, {}};
-    return ArgumentType{a_args, evt0_args, bias_args, {}};
+    typename EVTCompute0::Arguments evt0_args{b_args};
+    return ArgumentType{a_args, evt0_args, bias_args};
   }
 };
 
@@ -210,7 +210,7 @@ struct ScaledEpilogueBiasAzp
                                               EVTComputeAzp>;
 
   using ComputeScaleBiasA = cutlass::epilogue::threadblock::VisitorCompute<
-      cutlass::homogeneous_multiply_add, ElementD, float,
+      cutlass::multiply_add, ElementD, float,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
  public:
@@ -223,17 +223,16 @@ struct ScaledEpilogueBiasAzp
   static ArgumentType prepare_args(torch::Tensor const& a_scales,
                                    torch::Tensor const& b_scales,
                                    torch::Tensor const& azp_adj,
-                                   std::optional<torch::Tensor> const& bias) {
+                                   c10::optional<torch::Tensor> const& bias) {
     auto a_args = SUPER::template args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
     auto bias_args = SUPER::template args_from_tensor<Bias, ElementD>(bias);
     auto azp_adj_args =
         SUPER::template args_from_tensor<AzpWithAdj, int32_t>(azp_adj);
 
-    typename EVTComputeAzp::Arguments evt_azp_args{{}, azp_adj_args, {}};
-    typename EVTComputeScaleB::Arguments evt_scale_b_args{
-        b_args, evt_azp_args, {}};
-    return ArgumentType{a_args, evt_scale_b_args, bias_args, {}};
+    typename EVTComputeAzp::Arguments evt_azp_args{{}, azp_adj_args};
+    typename EVTComputeScaleB::Arguments evt_scale_b_args{b_args, evt_azp_args};
+    return ArgumentType{a_args, evt_scale_b_args, bias_args};
   }
 };
 
@@ -288,7 +287,7 @@ struct ScaledEpilogueBiasAzpToken
                                               EVTComputeAcc>;
 
   using ComputeScaleBiasA = cutlass::epilogue::threadblock::VisitorCompute<
-      cutlass::homogeneous_multiply_add, ElementD, float,
+      cutlass::multiply_add, ElementD, float,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
  public:
@@ -302,7 +301,7 @@ struct ScaledEpilogueBiasAzpToken
                                    torch::Tensor const& b_scales,
                                    torch::Tensor const& azp_adj,
                                    torch::Tensor const& azp,
-                                   std::optional<torch::Tensor> const& bias) {
+                                   c10::optional<torch::Tensor> const& bias) {
     auto a_args = SUPER::template args_from_tensor<ScaleA, float>(a_scales);
     auto b_args = SUPER::template args_from_tensor<ScaleB, float>(b_scales);
     auto bias_args = SUPER::template args_from_tensor<Bias, ElementD>(bias);
@@ -310,11 +309,10 @@ struct ScaledEpilogueBiasAzpToken
     auto azp_adj_args =
         SUPER::template args_from_tensor<AzpAdj, int32_t>(azp_adj);
 
-    typename EVTComputeAzp::Arguments evt_azp_args{azp_args, azp_adj_args, {}};
-    typename EVTComputeAcc::Arguments evt_acc_args{{}, evt_azp_args, {}};
-    typename EVTComputeScaleB::Arguments evt_scale_b_args{
-        b_args, evt_acc_args, {}};
-    return ArgumentType{a_args, evt_scale_b_args, bias_args, {}};
+    typename EVTComputeAzp::Arguments evt_azp_args{azp_args, azp_adj_args};
+    typename EVTComputeAcc::Arguments evt_acc_args{{}, evt_azp_args};
+    typename EVTComputeScaleB::Arguments evt_scale_b_args{b_args, evt_acc_args};
+    return ArgumentType{a_args, evt_scale_b_args, bias_args};
   }
 };
 

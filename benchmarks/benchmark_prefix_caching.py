@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Benchmark the efficiency of prefix caching.
 
@@ -12,8 +10,7 @@ Fixed example usage:
         --model meta-llama/Llama-2-7b-chat-hf \
         --enable-prefix-caching \
         --num-prompts 1 \
-        --repeat-count 100 \
-        --input-length-range 128:256
+        --repeat-count 100
 
 ShareGPT example usage:
     # This command samples 20 prompts with input lengths
@@ -32,15 +29,16 @@ import dataclasses
 import json
 import random
 import time
+from typing import List, Optional, Tuple
 
 from transformers import PreTrainedTokenizerBase
 
 from vllm import LLM, SamplingParams
 from vllm.engine.arg_utils import EngineArgs
-from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.utils import FlexibleArgumentParser
 
 try:
-    from vllm.tokenizers import get_tokenizer
+    from vllm.transformers_utils.tokenizer import get_tokenizer
 except ImportError:
     from backend_request_func import get_tokenizer
 
@@ -63,24 +61,23 @@ class Request:
     output_len: int
 
 
-def sample_tokens(tokenizer: PreTrainedTokenizerBase, length: int) -> list[int]:
+def sample_tokens(tokenizer: PreTrainedTokenizerBase, length: int) -> str:
     vocab = tokenizer.get_vocab()
-    all_special_ids = set(tokenizer.all_special_ids)
-
     # Remove the special tokens.
-    return random.choices(
-        [v for v in vocab.values() if v not in all_special_ids],
-        k=length,
-    )
+    vocab = {
+        k: v
+        for k, v in vocab.items() if k not in tokenizer.all_special_ids
+    }
+    return random.choices(list(vocab.values()), k=length)
 
 
 def sample_requests_from_dataset(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
-    input_length_range: tuple[int, int],
-    fixed_output_len: int | None,
-) -> list[Request]:
+    input_length_range: Tuple[int, int],
+    fixed_output_len: Optional[int],
+) -> List[Request]:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
 
@@ -90,10 +87,8 @@ def sample_requests_from_dataset(
     # Filter out the conversations with less than 2 turns.
     dataset = [data for data in dataset if len(data["conversations"]) >= 2]
     # Only keep the first two turns of each conversation.
-    dataset = [
-        (data["conversations"][0]["value"], data["conversations"][1]["value"])
-        for data in dataset
-    ]
+    dataset = [(data["conversations"][0]["value"],
+                data["conversations"][1]["value"]) for data in dataset]
 
     # Shuffle the dataset.
     random.shuffle(dataset)
@@ -102,7 +97,7 @@ def sample_requests_from_dataset(
     assert min_len >= 0 and max_len >= min_len, "input_length_range too small"
 
     # Filter out sequences that are too long or too short
-    filtered_requests: list[Request] = []
+    filtered_requests: List[Request] = []
 
     for i in range(len(dataset)):
         if len(filtered_requests) == num_requests:
@@ -114,9 +109,8 @@ def sample_requests_from_dataset(
         completion = dataset[i][1]
         completion_token_ids = tokenizer(completion).input_ids
         prompt_len = len(prompt_token_ids)
-        output_len = (
-            len(completion_token_ids) if fixed_output_len is None else fixed_output_len
-        )
+        output_len = (len(completion_token_ids)
+                      if fixed_output_len is None else fixed_output_len)
         if min_len <= prompt_len <= max_len:
             filtered_requests.append(Request(prompt, prompt_len, output_len))
 
@@ -126,31 +120,31 @@ def sample_requests_from_dataset(
 def sample_requests_from_random(
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
-    input_length_range: tuple[int, int],
-    fixed_output_len: int | None,
+    input_length_range: Tuple[int, int],
+    fixed_output_len: Optional[int],
     prefix_len: int,
-) -> list[Request]:
+) -> List[Request]:
+
     requests = []
     prefix_token_ids = sample_tokens(tokenizer, prefix_len)
     min_len, max_len = input_length_range
 
     for i in range(num_requests):
         unique_part_token_ids = sample_tokens(
-            tokenizer, random.randint(min_len - prefix_len, max_len - prefix_len)
-        )
+            tokenizer,
+            random.randint(min_len - prefix_len, max_len - prefix_len))
         prompt_token_ids = prefix_token_ids + unique_part_token_ids
         prompt = tokenizer.decode(prompt_token_ids)
         prompt_len = len(prompt_token_ids)
-        assert min_len <= prompt_len <= max_len, (
-            f"prompt_len {prompt_len} out of range {min_len}:{max_len}"
-        )
+        assert (min_len <= prompt_len <= max_len
+                ), f"prompt_len {prompt_len} out of range {min_len}:{max_len}"
         requests.append(Request(prompt, prompt_len, fixed_output_len))
     return requests
 
 
-def repeat_and_sort_requests(
-    requests: list[Request], repeat_count: int, sort: bool = False
-) -> list[str]:
+def repeat_and_sort_requests(requests: List[Request],
+                             repeat_count: int,
+                             sort: bool = False) -> List[str]:
     repeated_requests = requests * repeat_count
     if sort:
         repeated_requests.sort(key=lambda x: x[1])
@@ -161,14 +155,14 @@ def repeat_and_sort_requests(
 
 def main(args):
     tokenizer = get_tokenizer(args.model, trust_remote_code=True)
-    input_length_range = tuple(map(int, args.input_length_range.split(":")))
+    input_length_range = tuple(map(int, args.input_length_range.split(':')))
     random.seed(args.seed)
     if args.dataset_path is not None:
         if args.prefix_len > 0:
-            raise ValueError(
-                "prefix-len is not supported when dataset-path is provided."
-            )
-        print(f"Start to sample {args.num_prompts} prompts from {args.dataset_path}")
+            raise ValueError("prefix-len is not supported when "
+                             "dataset-path is provided.")
+        print(f"Start to sample {args.num_prompts} prompts "
+              f"from {args.dataset_path}")
         filtered_requests = sample_requests_from_dataset(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
@@ -198,16 +192,12 @@ def main(args):
 
     llm = LLM(**dataclasses.asdict(engine_args))
 
-    sampling_params = SamplingParams(
-        temperature=0,
-        max_tokens=args.output_len,
-        detokenize=not args.disable_detokenize,
-    )
+    sampling_params = SamplingParams(temperature=0, max_tokens=args.output_len)
 
     print("Testing filtered requests")
-    prompts = repeat_and_sort_requests(
-        filtered_requests, repeat_count=args.repeat_count, sort=args.sort
-    )
+    prompts = repeat_and_sort_requests(filtered_requests,
+                                       repeat_count=args.repeat_count,
+                                       sort=args.sort)
 
     print("------start generating------")
     test_prefix(
@@ -217,37 +207,31 @@ def main(args):
     )
 
 
-def create_argument_parser():
+if __name__ == "__main__":
     parser = FlexibleArgumentParser(
-        description="Benchmark the performance with or without "
-        "automatic prefix caching."
-    )
-    parser.add_argument(
-        "--dataset-path", type=str, default=None, help="Path to the dataset."
-    )
-    parser.add_argument("--output-len", type=int, default=10)
-    parser.add_argument(
-        "--num-prompts",
-        type=int,
-        required=True,
-        help="Number of the prompts sampled from dataset",
-    )
-    parser.add_argument(
-        "--repeat-count",
-        type=int,
-        default=1,
-        help="Number of times to repeat each prompt",
-    )
-    parser.add_argument(
-        "--sort", action="store_true", help="Sort prompts by input length"
-    )
-    parser.add_argument(
-        "--input-length-range",
-        type=str,
-        required=True,
-        help="Range of input lengths for sampling prompts,"
-        'specified as "min:max" (e.g., "128:256").',
-    )
+        description=
+        'Benchmark the performance with or without automatic prefix caching.')
+    parser.add_argument("--dataset-path",
+                        type=str,
+                        default=None,
+                        help="Path to the dataset.")
+    parser.add_argument('--output-len', type=int, default=10)
+    parser.add_argument('--num-prompts',
+                        type=int,
+                        required=True,
+                        help="Number of the prompts sampled from dataset")
+    parser.add_argument('--repeat-count',
+                        type=int,
+                        default=1,
+                        help='Number of times to repeat each prompt')
+    parser.add_argument('--sort',
+                        action='store_true',
+                        help='Sort prompts by input length')
+    parser.add_argument('--input-length-range',
+                        type=str,
+                        required=True,
+                        help='Range of input lengths for sampling prompts,'
+                        'specified as "min:max" (e.g., "128:256").')
     parser.add_argument(
         "--prefix-len",
         type=int,
@@ -257,21 +241,7 @@ def create_argument_parser():
         "subtract this length when filtering prompts. Only used "
         "when dataset-path is not provided.",
     )
-    parser.add_argument(
-        "--disable-detokenize",
-        action="store_true",
-        help=(
-            "Do not detokenize responses (i.e. do not include "
-            "detokenization time in the latency measurement)"
-        ),
-    )
 
     parser = EngineArgs.add_cli_args(parser)
-
-    return parser
-
-
-if __name__ == "__main__":
-    parser = create_argument_parser()
     args = parser.parse_args()
     main(args)

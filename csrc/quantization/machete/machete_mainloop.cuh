@@ -38,6 +38,7 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cute/atom/copy_traits_sm90_tma.hpp"
 #include "cute/algorithm/gemm.hpp"
+#include "cute/tensor_predicate.hpp"
 #include "cute/numeric/arithmetic_tuple.hpp"
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cutlass/transform/collective/sm90_wgmma_transpose.hpp"
@@ -65,11 +66,13 @@ struct MacheteCollectiveMma {
   using Schedule = KernelScheduleType;
   static_assert(
       cute::is_same_v<Schedule, KernelTmaWarpSpecialized> ||
-          cute::is_same_v<Schedule, KernelTmaWarpSpecialized> ||
+          cute::is_same_v<Schedule, KernelTmaWarpSpecializedMixedInput> ||
           cute::is_same_v<Schedule, KernelTmaWarpSpecializedPingpong> ||
-          cute::is_same_v<Schedule, KernelTmaWarpSpecializedPingpong> ||
+          cute::is_same_v<Schedule,
+                          KernelTmaWarpSpecializedPingpongMixedInput> ||
           cute::is_same_v<Schedule, KernelTmaWarpSpecializedCooperative> ||
-          cute::is_same_v<Schedule, KernelTmaWarpSpecializedCooperative>,
+          cute::is_same_v<Schedule,
+                          KernelTmaWarpSpecializedCooperativeMixedInput>,
       "KernelSchedule must be one of the warp specialized policies");
 
  public:
@@ -110,7 +113,8 @@ struct MacheteCollectiveMma {
   // For coop schedules we have two warp groups cooperatively issuing wgmma
   // instructions so we use 2 atoms along the M dim (one for each warpgroup)
   using AtomLayoutMNK = cute::conditional_t<
-      cute::is_same_v<KernelScheduleType, KernelTmaWarpSpecializedCooperative>,
+      cute::is_same_v<KernelScheduleType,
+                      KernelTmaWarpSpecializedCooperativeMixedInput>,
       Layout<Shape<_2, _1, _1>>, Layout<Shape<_1, _1, _1>>>;
 
   using TiledMma = decltype(cute::make_tiled_mma(
@@ -271,10 +275,6 @@ struct MacheteCollectiveMma {
   using PipelineState = cutlass::PipelineState<DispatchPolicy::Stages>;
 
   using PipelineParams = typename MainloopPipeline::Params;
-
-  // One threads per CTA are producers (1 for operand tile)
-  static constexpr int NumProducerThreadEvents = 1;
-
   using ScaleTileShape = decltype(make_shape(shape<0>(TileShape{}),
                                              shape<1>(SmemLayoutAtomScale{})));
 
@@ -617,7 +617,7 @@ struct MacheteCollectiveMma {
 
   // Same as upstream, should be kept the same when possible, not formatted for
   // easier comparison
-  //   with `SwapAB ? N : M -> M` since we don't support SwapAB
+  //   with `SwapAB ? N : M -> M` since we dont support SwapAB
   // clang-format off
   template<class ProblemShape>
   static bool
@@ -1002,7 +1002,7 @@ struct MacheteCollectiveMma {
     static constexpr int A_CPY_VEC =
         decltype(max_common_vector(tCsA, tCrA_load)){};
 
-    static constexpr int CONVERSION_WIDTH =
+    static constexpr int COVERSION_WIDTH =
         std::min(A_CPY_VEC, int(size<0>(tCrA_mma)));
 
     auto load_A_to_registers = [&](int read_stage) {
@@ -1025,8 +1025,8 @@ struct MacheteCollectiveMma {
     // PIPELINED MAIN LOOP
     //
 
-    auto convert_A = [&, a_vec = Int<CONVERSION_WIDTH>{}](int k_block,
-                                                          int read_stage) {
+    auto convert_A = [&, a_vec = Int<COVERSION_WIDTH>{}](int k_block,
+                                                         int read_stage) {
       load_extra_info_to_registers(partitioned_extra_info,
                                    copy_partitions_extra_info, k_block,
                                    read_stage);
