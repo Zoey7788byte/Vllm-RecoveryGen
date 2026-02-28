@@ -67,6 +67,15 @@ class Stats:
     max_lora: str
 
     spec_decode_metrics: Optional["SpecDecodeWorkerMetrics"] = None
+    recovery_swapin_blocks_iter: int = 0
+    recovery_swapout_blocks_iter: int = 0
+    recovery_recompute_tokens_iter: int = 0
+    recovery_restore_progress_stall_ms_iter: float = 0.0
+    recovery_mode: str = "normal"
+    recovery_mode_switches_iter: int = 0
+    recovery_online_load_est_sys: int = 0
+    recovery_seq_slack_est_iter: int = 0
+    recovery_token_slack_est_iter: int = 0
 
 
 class SupportsMetricsInfo(Protocol):

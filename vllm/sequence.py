@@ -122,6 +122,20 @@ class RequestMetrics:
     model_execute_time: Optional[float] = None
 
 
+@dataclass
+class RecoveryObsState:
+    # Placeholder state for phase-1+ recovery mechanism.
+    mode: str = "NORMAL"
+    mode_enter_ts_ns: int = 0
+    preempt_cnt: int = 0
+    last_restore_progress_ts_ns: int = 0
+    swapin_blocks_total: int = 0
+    swapout_blocks_total: int = 0
+    recompute_tokens_total: int = 0
+    restore_frontier: int = -1
+    swap_frontier: int = -1
+
+
 class SequenceDataDelta(
         msgspec.Struct,
         array_like=True,  # type: ignore[call-arg]
@@ -667,6 +681,7 @@ class SequenceGroup:
                                       first_scheduled_time=None,
                                       first_token_time=None,
                                       time_in_queue=None)
+        self.recovery_obs = RecoveryObsState()
         self.lora_request = lora_request
         self.prompt_logprobs: Optional[PromptLogprobs] = None
         self.state = SequenceGroupState()

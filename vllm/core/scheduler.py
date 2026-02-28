@@ -10,6 +10,7 @@ from typing import Set, Tuple, Union
 
 from vllm.config import CacheConfig, LoRAConfig, SchedulerConfig
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.core.recovery_observability import RecoveryObservability
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
@@ -149,6 +150,19 @@ class SchedulerOutputs:
     # The number of requests in the running queue
     running_queue_size: int
     preempted: int
+    # Phase-0 recovery observability fields.
+    recovery_swapin_blocks: int = 0
+    recovery_swapout_blocks: int = 0
+    recovery_recompute_tokens: int = 0
+    recovery_restore_progress_stall_ms: float = 0.0
+    recovery_mode: str = "normal"
+    recovery_mode_switches_cycle: int = 0
+    recovery_mode_switches_total: int = 0
+    recovery_online_load_est: int = 0
+    recovery_seq_slack_est: int = 0
+    recovery_token_slack_est: int = 0
+    recovery_gpu_kv_blocks_free: int = 0
+    recovery_cpu_kv_blocks_free: int = 0
 
     def __post_init__(self):
         # Swap in and swap out should never happen at the same time.
@@ -390,6 +404,10 @@ class Scheduler:
                                        if self.enable_artificial_preemption
                                        else 0)
         self.num_cumulative_preemption: int = 0
+        self._recovery_obs = RecoveryObservability.from_config()
+        if hasattr(self.block_manager, "set_swap_event_callback"):
+            self.block_manager.set_swap_event_callback(
+                self._recovery_obs.on_block_swap_event)
 
         # Used to cache python objects
         self._seq_group_metadata_cache: List[PyObjectCache] = []
@@ -635,8 +653,11 @@ class Scheduler:
 
                 # Do preemption
                 if do_preempt:
-                    preempted_mode = self._preempt(victim_seq_group,
-                                                   blocks_to_swap_out)
+                    preempted_mode = self._preempt(
+                        victim_seq_group,
+                        blocks_to_swap_out,
+                        reason="kv_cache_cannot_append_slots",
+                    )
                     if preempted_mode == PreemptionMode.RECOMPUTE:
                         preempted.append(victim_seq_group)
                     else:
@@ -875,7 +896,9 @@ class Scheduler:
                                          num_running_seqs)
 
                 #Preempt out the victim sequence group
-                self._preempt(vseq_group, blocks_to_swap_out)
+                self._preempt(vseq_group,
+                              blocks_to_swap_out,
+                              reason="priority_inversion")
                 waiting_queue.appendleft(vseq_group)
                 force_preemption_count += 1
             #Put the sequence back into the waiting queue
@@ -1288,6 +1311,8 @@ class Scheduler:
         # This function call changes the internal states of the scheduler
         # such as self.running, self.swapped, and self.waiting.
         scheduler_start_time = time.perf_counter()
+        cycle_begin_wall_s = time.time()
+        self._recovery_obs.on_cycle_begin(cycle_begin_wall_s, self)
 
         scheduler_outputs: SchedulerOutputs = self._schedule()
         now = time.time()
@@ -1421,6 +1446,15 @@ class Scheduler:
         self._seq_group_metadata_cache[self.next_cache_id].reset()
 
         scheduler_time = time.perf_counter() - scheduler_start_time
+        cycle_end_wall_s = time.time()
+        self._recovery_obs.on_cycle_end(
+            cycle_end_wall_s,
+            {
+                "scheduler": self,
+                "scheduler_outputs": scheduler_outputs,
+                "scheduler_time_s": scheduler_time,
+            },
+        )
         # Add this to scheduler time to all the sequences that are currently
         # running. This will help estimate if the scheduler is a significant
         # component in the e2e latency.
@@ -1527,8 +1561,10 @@ class Scheduler:
             if len(cows) > 0:
                 blocks_to_copy.extend(cows)
 
-    def _preempt(self, seq_group: SequenceGroup,
-                 blocks_to_swap_out: List[Tuple[int, int]]) -> PreemptionMode:
+    def _preempt(self,
+                 seq_group: SequenceGroup,
+                 blocks_to_swap_out: List[Tuple[int, int]],
+                 reason: str = "kv_cache_pressure") -> PreemptionMode:
         # If preemption mode is not specified, we determine the mode as follows:
         # We use recomputation by default since it incurs lower overhead than
         # swapping. However, when the sequence group has multiple sequences
@@ -1560,6 +1596,13 @@ class Scheduler:
                 "total_num_cumulative_preemption=%d", seq_group.request_id,
                 preemption_mode, self.num_cumulative_preemption + 1)
         self.num_cumulative_preemption += 1
+        self._recovery_obs.note_preemption(
+            request_id=seq_group.request_id,
+            mode=preemption_mode.name.lower(),
+            reason=reason,
+            seq_ids=[seq.seq_id for seq in seq_group.get_seqs()],
+            seq_group=seq_group,
+        )
 
         if preemption_mode == PreemptionMode.RECOMPUTE:
             self._preempt_by_recompute(seq_group)
@@ -1575,10 +1618,16 @@ class Scheduler:
     ) -> None:
         seqs = seq_group.get_seqs(status=SequenceStatus.RUNNING)
         assert len(seqs) == 1
+        recompute_tokens = 0
         for seq in seqs:
+            recompute_tokens += seq.get_len()
             seq.status = SequenceStatus.WAITING
             self.free_seq(seq)
             seq.reset_state_for_recompute()
+        self._recovery_obs.note_recompute_tokens(
+            request_id=seq_group.request_id,
+            tokens=recompute_tokens,
+        )
 
     def _preempt_by_swap(
         self,

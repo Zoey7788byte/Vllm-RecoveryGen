@@ -1609,6 +1609,32 @@ class LLMEngine:
         time_per_output_tokens_iter: List[float] = []
         num_preemption_iter = (0 if scheduler_outputs is None else
                                scheduler_outputs.preempted)
+        recovery_swapin_blocks_iter = (
+            0 if scheduler_outputs is None else
+            scheduler_outputs.recovery_swapin_blocks)
+        recovery_swapout_blocks_iter = (
+            0 if scheduler_outputs is None else
+            scheduler_outputs.recovery_swapout_blocks)
+        recovery_recompute_tokens_iter = (
+            0 if scheduler_outputs is None else
+            scheduler_outputs.recovery_recompute_tokens)
+        recovery_restore_progress_stall_ms_iter = (
+            0.0 if scheduler_outputs is None else
+            scheduler_outputs.recovery_restore_progress_stall_ms)
+        recovery_mode = ("normal" if scheduler_outputs is None else
+                         scheduler_outputs.recovery_mode)
+        recovery_mode_switches_iter = (
+            0 if scheduler_outputs is None else
+            scheduler_outputs.recovery_mode_switches_cycle)
+        recovery_online_load_est_sys = (
+            0 if scheduler_outputs is None else
+            scheduler_outputs.recovery_online_load_est)
+        recovery_seq_slack_est_iter = (
+            0 if scheduler_outputs is None else
+            scheduler_outputs.recovery_seq_slack_est)
+        recovery_token_slack_est_iter = (
+            0 if scheduler_outputs is None else
+            scheduler_outputs.recovery_token_slack_est)
 
         # Request stats
         #   Latency
@@ -1796,6 +1822,16 @@ class LLMEngine:
             time_per_output_tokens_iter=time_per_output_tokens_iter,
             spec_decode_metrics=spec_decode_metrics,
             num_preemption_iter=num_preemption_iter,
+            recovery_swapin_blocks_iter=recovery_swapin_blocks_iter,
+            recovery_swapout_blocks_iter=recovery_swapout_blocks_iter,
+            recovery_recompute_tokens_iter=recovery_recompute_tokens_iter,
+            recovery_restore_progress_stall_ms_iter=
+            recovery_restore_progress_stall_ms_iter,
+            recovery_mode=recovery_mode,
+            recovery_mode_switches_iter=recovery_mode_switches_iter,
+            recovery_online_load_est_sys=recovery_online_load_est_sys,
+            recovery_seq_slack_est_iter=recovery_seq_slack_est_iter,
+            recovery_token_slack_est_iter=recovery_token_slack_est_iter,
 
             # Request stats
             #   Latency

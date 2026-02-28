@@ -1,5 +1,5 @@
 """A block manager that manages token blocks."""
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Tuple
 
@@ -10,11 +10,16 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.logger import init_logger
 from vllm.sequence import Sequence, SequenceGroup, SequenceStatus
 from vllm.utils import Device
 
 SeqId = int
 EncoderSeqId = str
+SwapEventCallback = Callable[[str, SequenceGroup, int, int, Optional[str],
+                              Optional[int]], None]
+
+logger = init_logger(__name__)
 
 
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
@@ -104,6 +109,28 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self.block_allocator, self.block_size, self.enable_caching)
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
+        self._swap_event_callback: Optional[SwapEventCallback] = None
+
+    def set_swap_event_callback(
+            self, callback: Optional[SwapEventCallback]) -> None:
+        self._swap_event_callback = callback
+
+    def _emit_swap_event(self,
+                         event: str,
+                         seq_group: SequenceGroup,
+                         seq_id: int,
+                         blocks: int,
+                         reason: Optional[str] = None,
+                         bytes_count: Optional[int] = None) -> None:
+        if self._swap_event_callback is None or blocks <= 0:
+            return
+        try:
+            self._swap_event_callback(event, seq_group, seq_id, blocks, reason,
+                                      bytes_count)
+        except Exception as exc:
+            logger.warning(
+                "Failed swap event callback (%s, req=%s, seq=%s): %r", event,
+                seq_group.request_id, seq_id, exc)
 
     def can_allocate(self,
                      seq_group: SequenceGroup,
@@ -376,6 +403,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
                                                          src_device=Device.CPU,
                                                          dst_device=Device.GPU)
+            self._emit_swap_event(event="swap_in",
+                                  seq_group=seq_group,
+                                  seq_id=seq.seq_id,
+                                  blocks=len(seq_swap_mapping),
+                                  reason="swap_in_exec")
 
             # Refresh the block ids of the table (post-swap)
             self.block_tables[seq.seq_id].update(blocks)
@@ -429,6 +461,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
                                                          src_device=Device.GPU,
                                                          dst_device=Device.CPU)
+            self._emit_swap_event(event="swap_out",
+                                  seq_group=seq_group,
+                                  seq_id=seq.seq_id,
+                                  blocks=len(seq_swap_mapping),
+                                  reason="swap_out_exec")
 
             # Refresh the block ids of the table (post-swap)
             self.block_tables[seq.seq_id].update(blocks)

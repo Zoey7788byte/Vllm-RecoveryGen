@@ -41,6 +41,7 @@ class Metrics:
     labelname_waiting_lora_adapters = "waiting_lora_adapters"
     labelname_running_lora_adapters = "running_lora_adapters"
     labelname_max_lora = "max_lora"
+    labelname_recovery_mode = "recovery_mode"
     _gauge_cls = prometheus_client.Gauge
     _counter_cls = prometheus_client.Counter
     _histogram_cls = prometheus_client.Histogram
@@ -118,6 +119,47 @@ class Metrics:
             name="vllm:tokens_total",
             documentation="Number of prefill plus generation tokens processed.",
             labelnames=labelnames)
+        self.counter_recovery_swapin_blocks = self._counter_cls(
+            name="vllm:recovery_swapin_blocks_total",
+            documentation="Cumulative number of swap-in KV blocks.",
+            labelnames=labelnames)
+        self.counter_recovery_swapout_blocks = self._counter_cls(
+            name="vllm:recovery_swapout_blocks_total",
+            documentation="Cumulative number of swap-out KV blocks.",
+            labelnames=labelnames)
+        self.counter_recovery_recompute_tokens = self._counter_cls(
+            name="vllm:recovery_recompute_tokens_total",
+            documentation="Cumulative recompute token cost from preemption.",
+            labelnames=labelnames)
+        self.counter_recovery_restore_progress_stall_ms = self._counter_cls(
+            name="vllm:recovery_restore_progress_stall_ms_total",
+            documentation=
+            "Cumulative stall time in ms while recovery has no progress.",
+            labelnames=labelnames)
+        self.counter_recovery_mode_switches = self._counter_cls(
+            name="vllm:recovery_mode_switches_total",
+            documentation="Cumulative number of recovery mode switches.",
+            labelnames=labelnames)
+        self.gauge_recovery_mode = self._gauge_cls(
+            name="vllm:recovery_mode",
+            documentation="Recovery mode id (0=normal,1=recovery,2=fallback).",
+            labelnames=labelnames,
+            multiprocess_mode="sum")
+        self.gauge_recovery_online_load = self._gauge_cls(
+            name="vllm:recovery_online_load_est",
+            documentation="Estimated online load (waiting+running+swapped).",
+            labelnames=labelnames,
+            multiprocess_mode="sum")
+        self.gauge_recovery_seq_slack = self._gauge_cls(
+            name="vllm:recovery_seq_slack_est",
+            documentation="Estimated sequence slack under max_num_seqs.",
+            labelnames=labelnames,
+            multiprocess_mode="sum")
+        self.gauge_recovery_token_slack = self._gauge_cls(
+            name="vllm:recovery_token_slack_est",
+            documentation="Estimated token slack under max batched tokens.",
+            labelnames=labelnames,
+            multiprocess_mode="sum")
         buckets = [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8096]
         if not vllm_config.model_config.enforce_eager:
             buckets = vllm_config.compilation_config.capture_sizes.copy()
@@ -573,6 +615,19 @@ class PrometheusStatLogger(StatLoggerBase):
                         stats.cpu_prefix_cache_hit_rate)
         self._log_gauge(self.metrics.gauge_gpu_prefix_cache_hit_rate,
                         stats.gpu_prefix_cache_hit_rate)
+        recovery_mode_map = {
+            "normal": 0,
+            "recovery": 1,
+            "fallback": 2,
+        }
+        self._log_gauge(self.metrics.gauge_recovery_mode,
+                        recovery_mode_map.get(stats.recovery_mode, 0))
+        self._log_gauge(self.metrics.gauge_recovery_online_load,
+                        stats.recovery_online_load_est_sys)
+        self._log_gauge(self.metrics.gauge_recovery_seq_slack,
+                        stats.recovery_seq_slack_est_iter)
+        self._log_gauge(self.metrics.gauge_recovery_token_slack,
+                        stats.recovery_token_slack_est_iter)
         # Including max-lora in metric, in future this property of lora
         # config maybe extended to be dynamic.
         lora_info = {
@@ -591,6 +646,17 @@ class PrometheusStatLogger(StatLoggerBase):
                           stats.num_prompt_tokens_iter)
         self._log_counter(self.metrics.counter_generation_tokens,
                           stats.num_generation_tokens_iter)
+        self._log_counter(self.metrics.counter_recovery_swapin_blocks,
+                          stats.recovery_swapin_blocks_iter)
+        self._log_counter(self.metrics.counter_recovery_swapout_blocks,
+                          stats.recovery_swapout_blocks_iter)
+        self._log_counter(self.metrics.counter_recovery_recompute_tokens,
+                          stats.recovery_recompute_tokens_iter)
+        self._log_counter(
+            self.metrics.counter_recovery_restore_progress_stall_ms,
+            stats.recovery_restore_progress_stall_ms_iter)
+        self._log_counter(self.metrics.counter_recovery_mode_switches,
+                          stats.recovery_mode_switches_iter)
         self._log_histogram(self.metrics.histogram_iteration_tokens,
                             [stats.num_tokens_iter])
         self._log_histogram(self.metrics.histogram_time_to_first_token,
