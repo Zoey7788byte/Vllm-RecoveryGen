@@ -1,6 +1,6 @@
 import enum
 from abc import ABC, abstractmethod
-from typing import List
+from typing import List, Optional
 from typing import Sequence as GenericSequence
 from typing import Tuple
 
@@ -67,12 +67,18 @@ class BlockSpaceManager(ABC):
         pass
 
     @abstractmethod
-    def can_swap_in(self, seq_group: SequenceGroup,
-                    num_lookahead_slots: int) -> AllocStatus:
+    def can_swap_in(self,
+                    seq_group: SequenceGroup,
+                    num_lookahead_slots: int,
+                    k_swap_max: Optional[int] = None) -> AllocStatus:
         pass
 
     @abstractmethod
-    def swap_in(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
+    def swap_in(
+        self,
+        seq_group: SequenceGroup,
+        k_swap_max: Optional[int] = None,
+    ) -> Tuple[List[Tuple[int, int]], int]:
         pass
 
     @abstractmethod

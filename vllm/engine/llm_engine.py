@@ -1610,31 +1610,31 @@ class LLMEngine:
         num_preemption_iter = (0 if scheduler_outputs is None else
                                scheduler_outputs.preempted)
         recovery_swapin_blocks_iter = (
-            0 if scheduler_outputs is None else
-            scheduler_outputs.recovery_swapin_blocks)
+            0 if scheduler_outputs is None else getattr(
+                scheduler_outputs, "recovery_swapin_blocks", 0))
         recovery_swapout_blocks_iter = (
-            0 if scheduler_outputs is None else
-            scheduler_outputs.recovery_swapout_blocks)
+            0 if scheduler_outputs is None else getattr(
+                scheduler_outputs, "recovery_swapout_blocks", 0))
         recovery_recompute_tokens_iter = (
-            0 if scheduler_outputs is None else
-            scheduler_outputs.recovery_recompute_tokens)
+            0 if scheduler_outputs is None else getattr(
+                scheduler_outputs, "recovery_recompute_tokens", 0))
         recovery_restore_progress_stall_ms_iter = (
-            0.0 if scheduler_outputs is None else
-            scheduler_outputs.recovery_restore_progress_stall_ms)
-        recovery_mode = ("normal" if scheduler_outputs is None else
-                         scheduler_outputs.recovery_mode)
+            0.0 if scheduler_outputs is None else getattr(
+                scheduler_outputs, "recovery_restore_progress_stall_ms", 0.0))
+        recovery_mode = ("normal" if scheduler_outputs is None else getattr(
+            scheduler_outputs, "recovery_mode", "normal"))
         recovery_mode_switches_iter = (
-            0 if scheduler_outputs is None else
-            scheduler_outputs.recovery_mode_switches_cycle)
+            0 if scheduler_outputs is None else getattr(
+                scheduler_outputs, "recovery_mode_switches_cycle", 0))
         recovery_online_load_est_sys = (
-            0 if scheduler_outputs is None else
-            scheduler_outputs.recovery_online_load_est)
+            0 if scheduler_outputs is None else getattr(
+                scheduler_outputs, "recovery_online_load_est", 0))
         recovery_seq_slack_est_iter = (
-            0 if scheduler_outputs is None else
-            scheduler_outputs.recovery_seq_slack_est)
+            0 if scheduler_outputs is None else getattr(
+                scheduler_outputs, "recovery_seq_slack_est", 0))
         recovery_token_slack_est_iter = (
-            0 if scheduler_outputs is None else
-            scheduler_outputs.recovery_token_slack_est)
+            0 if scheduler_outputs is None else getattr(
+                scheduler_outputs, "recovery_token_slack_est", 0))
 
         # Request stats
         #   Latency

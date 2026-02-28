@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
+    VLLM_RECOVERY_V2: int = 0
 
 
 def get_default_cache_root():
@@ -466,6 +467,73 @@ environment_variables: Dict[str, Callable[[], Any]] = {
     lambda: float(os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")),
     "VLLM_DISABLE_COMPILE_CACHE":
     lambda: bool(int(os.getenv("VLLM_DISABLE_COMPILE_CACHE", "0"))),
+
+    # Recovery observability and controls.
+    "VLLM_RECOVERY_OBS":
+    lambda:
+    (os.environ.get("VLLM_RECOVERY_OBS", "1").strip().lower() in ("1", "true",
+                                                                    "yes",
+                                                                    "on")),
+    "VLLM_RECOVERY_FLAGS_JSON":
+    lambda: os.getenv("VLLM_RECOVERY_FLAGS_JSON", None),
+    "VLLM_RECOVERY_LOG_DIR":
+    lambda: os.getenv("VLLM_RECOVERY_LOG_DIR", "/tmp/vllm_recovery"),
+    "VLLM_RECOVERY_TS_PERIOD_MS":
+    lambda: int(os.getenv("VLLM_RECOVERY_TS_PERIOD_MS", "50")),
+    "VLLM_RECOVERY_V2":
+    lambda: int(os.getenv("VLLM_RECOVERY_V2", "0")),
+    "VLLM_RECOVERY_BUDGET":
+    lambda: int(os.getenv("VLLM_RECOVERY_BUDGET", "0")),
+    "VLLM_RECOVERY_PHASE":
+    lambda: int(os.getenv("VLLM_RECOVERY_PHASE", "0")),
+    "VLLM_RECOVERY_MIN_BUDGET":
+    lambda: int(os.getenv("VLLM_RECOVERY_MIN_BUDGET", "1")),
+    "VLLM_RECOVERY_SWAP_MS_PER_BLOCK":
+    lambda: float(os.getenv("VLLM_RECOVERY_SWAP_MS_PER_BLOCK", "0.2")),
+    "REC_T_CYC_MS":
+    lambda: float(os.getenv("REC_T_CYC_MS", "80")),
+    "REC_BUDGET_INIT_MS":
+    lambda: float(os.getenv("REC_BUDGET_INIT_MS", "5")),
+    "REC_BUDGET_MIN_MS":
+    lambda: float(os.getenv("REC_BUDGET_MIN_MS", "1")),
+    "REC_DPLUS_MS":
+    lambda: float(os.getenv("REC_DPLUS_MS", "5")),
+    "REC_DMINUS_MS":
+    lambda: float(os.getenv("REC_DMINUS_MS", "5")),
+    "REC_STALL_MS":
+    lambda: float(os.getenv("REC_STALL_MS", "300")),
+    "REC_HIGH_UTIL_THRESHOLD":
+    lambda: float(os.getenv("REC_HIGH_UTIL_THRESHOLD", "0.90")),
+    "REC_HIGH_UTIL_EMA_THRESHOLD":
+    lambda: float(os.getenv("REC_HIGH_UTIL_EMA_THRESHOLD", "0.85")),
+    "REC_HIGH_LOAD_WAITING_THRESHOLD":
+    lambda: int(os.getenv("REC_HIGH_LOAD_WAITING_THRESHOLD", "1")),
+    "REC_PREFETCH_MAX_BLOCKS":
+    lambda: int(os.getenv("REC_PREFETCH_MAX_BLOCKS", "2048")),
+    "REC_MODE_STABLE_WINDOW_MS":
+    lambda: float(os.getenv("REC_MODE_STABLE_WINDOW_MS", "120")),
+    "REC_MWS_PREFIX_TOKENS":
+    lambda: int(os.getenv("REC_MWS_PREFIX_TOKENS", "256")),
+    "REC_MWS_RECENT_TOKENS":
+    lambda: int(os.getenv("REC_MWS_RECENT_TOKENS", "1024")),
+    "REC_MWS_ADMIT_RHO":
+    lambda: float(os.getenv("REC_MWS_ADMIT_RHO", "0.25")),
+    "REC_FALLBACK_STALL_MS":
+    lambda: float(os.getenv("REC_FALLBACK_STALL_MS", "600")),
+    "REC_FALLBACK_RESIDENCE_MS":
+    lambda: float(os.getenv("REC_FALLBACK_RESIDENCE_MS", "300")),
+    "REC_FALLBACK_PREEMPT_THRESHOLD":
+    lambda: int(os.getenv("REC_FALLBACK_PREEMPT_THRESHOLD", "3")),
+    "REC_FALLBACK_PROTECT_PRIORITY_GTE":
+    lambda: int(os.getenv("REC_FALLBACK_PROTECT_PRIORITY_GTE", "-1")),
+    "REC_FALLBACK_PAUSE_DECODE":
+    lambda:
+    (os.environ.get("REC_FALLBACK_PAUSE_DECODE", "0").strip().lower() in
+     ("1", "true", "yes", "on")),
+    "REC_FALLBACK_DECODE_INTERVAL_CYCLES":
+    lambda: int(os.getenv("REC_FALLBACK_DECODE_INTERVAL_CYCLES", "1")),
+    "REC_FALLBACK_BUDGET_BOOST_MS":
+    lambda: float(os.getenv("REC_FALLBACK_BUDGET_BOOST_MS", "0.5")),
 }
 
 # end-env-vars-definition

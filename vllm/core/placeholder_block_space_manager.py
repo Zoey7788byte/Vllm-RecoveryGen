@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.sequence import Sequence, SequenceGroup
@@ -46,12 +46,18 @@ class PlaceholderBlockSpaceManager(BlockSpaceManager):
     def fork(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         pass
 
-    def can_swap_in(self, seq_group: SequenceGroup,
-                    num_lookahead_slots: int) -> AllocStatus:
+    def can_swap_in(self,
+                    seq_group: SequenceGroup,
+                    num_lookahead_slots: int,
+                    k_swap_max: Optional[int] = None) -> AllocStatus:
         return AllocStatus.OK
 
-    def swap_in(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
-        return None  # type: ignore
+    def swap_in(
+        self,
+        seq_group: SequenceGroup,
+        k_swap_max: Optional[int] = None,
+    ) -> Tuple[List[Tuple[int, int]], int]:
+        return ([], 0)
 
     def can_swap_out(self, seq_group: SequenceGroup) -> bool:
         return True

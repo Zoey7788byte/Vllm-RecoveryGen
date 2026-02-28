@@ -1,6 +1,7 @@
 """Sequence and its related classes."""
 import copy
 import enum
+import time
 from abc import ABC, abstractmethod
 from array import array
 from collections import defaultdict
@@ -120,20 +121,6 @@ class RequestMetrics:
     scheduler_time: Optional[float] = None
     model_forward_time: Optional[float] = None
     model_execute_time: Optional[float] = None
-
-
-@dataclass
-class RecoveryObsState:
-    # Placeholder state for phase-1+ recovery mechanism.
-    mode: str = "NORMAL"
-    mode_enter_ts_ns: int = 0
-    preempt_cnt: int = 0
-    last_restore_progress_ts_ns: int = 0
-    swapin_blocks_total: int = 0
-    swapout_blocks_total: int = 0
-    recompute_tokens_total: int = 0
-    restore_frontier: int = -1
-    swap_frontier: int = -1
 
 
 class SequenceDataDelta(
@@ -397,6 +384,259 @@ class SequenceData(msgspec.Struct,
                 f"get_num_computed_tokens={self.get_num_computed_tokens()}")
 
 
+class RecoveryMode(enum.Enum):
+    NORMAL = "NORMAL"
+    RECOVERY = "RECOVERY"
+    FALLBACK = "FALLBACK"
+
+
+class RecoveryStorageHint(enum.Enum):
+    GPU_RESIDENT = "GPU_RESIDENT"
+    HOST_STORED = "HOST_STORED"
+    MISSING_RECOMPUTE = "MISSING_RECOMPUTE"
+
+
+@dataclass
+class RecoveryState:
+    recovery_enabled: bool = False
+    mode: RecoveryMode = RecoveryMode.NORMAL
+    storage_hint: Dict[int, RecoveryStorageHint] = field(default_factory=dict)
+    swap_frontier: int = 0
+    rec_frontier: int = 0
+    restored_map: List[bool] = field(default_factory=list)
+    last_progress_ts_ns: int = 0
+    num_recovery_attempts: int = 0
+    swapin_blocks_total: int = 0
+    swapout_blocks_total: int = 0
+    recompute_tokens_total: int = 0
+
+    def ensure_blocks(self, num_blocks: int) -> None:
+        if num_blocks <= 0:
+            return
+        if len(self.restored_map) < num_blocks:
+            self.restored_map.extend([False] * (num_blocks - len(
+                self.restored_map)))
+        for i in range(num_blocks):
+            if i not in self.storage_hint:
+                self.storage_hint[i] = RecoveryStorageHint.GPU_RESIDENT
+
+    def align_to_num_blocks(self, num_blocks: int) -> None:
+        # Keep recovery ledger strictly aligned with the physical block table.
+        # This avoids stale HOST_STORED indices that can never be swapped back.
+        num_blocks = max(0, int(num_blocks))
+        if num_blocks == 0:
+            self.storage_hint.clear()
+            self.restored_map = []
+            self.swap_frontier = 0
+            return
+        if len(self.restored_map) < num_blocks:
+            self.restored_map.extend([False] * (num_blocks - len(
+                self.restored_map)))
+        elif len(self.restored_map) > num_blocks:
+            self.restored_map = self.restored_map[:num_blocks]
+        if self.storage_hint:
+            self.storage_hint = {
+                idx: hint
+                for idx, hint in self.storage_hint.items()
+                if 0 <= idx < num_blocks
+            }
+        for i in range(num_blocks):
+            if i not in self.storage_hint:
+                self.storage_hint[i] = RecoveryStorageHint.GPU_RESIDENT
+        self.swap_frontier = min(max(0, self.swap_frontier), num_blocks)
+
+    def num_blocks(self) -> int:
+        if self.restored_map:
+            return len(self.restored_map)
+        if self.storage_hint:
+            return max(self.storage_hint.keys()) + 1
+        return 0
+
+    def mark_all(self, hint: RecoveryStorageHint) -> None:
+        num_blocks = self.num_blocks()
+        if num_blocks <= 0:
+            return
+        self.ensure_blocks(num_blocks)
+        for i in range(num_blocks):
+            self.storage_hint[i] = hint
+
+    def mark_range(self, start: int, end: int,
+                   hint: RecoveryStorageHint) -> None:
+        s = max(0, start)
+        e = max(s, end)
+        if e <= 0:
+            return
+        self.ensure_blocks(e)
+        e = min(e, self.num_blocks())
+        for i in range(s, e):
+            self.storage_hint[i] = hint
+
+    def reset_restored_map(self, num_blocks: Optional[int] = None) -> None:
+        if num_blocks is None:
+            num_blocks = self.num_blocks()
+        if num_blocks <= 0:
+            self.restored_map = []
+            return
+        self.restored_map = [False] * num_blocks
+
+    def commit_restored_range(self, start: int, end: int) -> None:
+        s = max(0, start)
+        e = max(s, end)
+        if e <= 0:
+            return
+        self.ensure_blocks(e)
+        e = min(e, self.num_blocks())
+        for i in range(s, e):
+            self.restored_map[i] = True
+        self.note_progress()
+
+    def commit_restored_indices(self, indices: List[int]) -> None:
+        if not indices:
+            return
+        max_idx = max(indices)
+        self.ensure_blocks(max_idx + 1)
+        for idx in indices:
+            if 0 <= idx < len(self.restored_map):
+                self.restored_map[idx] = True
+        self.note_progress()
+
+    def commit_progress(
+            self,
+            kind: str,
+            start: int,
+            end: int,
+            *,
+            indices: Optional[List[int]] = None,
+            token_after: Optional[int] = None) -> Tuple[int, int, int]:
+        committed_indices: List[int] = []
+        if indices is not None:
+            if not indices:
+                return 0, 0, self.get_restored_frontier()
+            max_idx = max(indices)
+            self.ensure_blocks(max_idx + 1)
+            num_blocks = self.num_blocks()
+            committed_indices = sorted({
+                idx
+                for idx in indices if 0 <= idx < num_blocks
+            })
+            if not committed_indices:
+                return 0, 0, self.get_restored_frontier()
+            s = committed_indices[0]
+            e = committed_indices[-1] + 1
+            for idx in committed_indices:
+                self.restored_map[idx] = True
+        else:
+            s = max(0, start)
+            e = max(s, end)
+            if e <= 0:
+                return s, s, self.get_restored_frontier()
+            self.ensure_blocks(e)
+            e = min(e, self.num_blocks())
+            committed_indices = list(range(s, e))
+            for idx in committed_indices:
+                self.restored_map[idx] = True
+
+        if kind == "swap":
+            for idx in committed_indices:
+                self.storage_hint[idx] = RecoveryStorageHint.GPU_RESIDENT
+            next_host = self.first_host_block()
+            if next_host is None:
+                self.swap_frontier = self.num_blocks()
+            else:
+                self.swap_frontier = max(self.swap_frontier, next_host)
+        elif kind == "recompute":
+            for idx in committed_indices:
+                self.storage_hint[idx] = RecoveryStorageHint.GPU_RESIDENT
+            if token_after is not None:
+                self.rec_frontier = max(self.rec_frontier, int(token_after))
+
+        self.note_progress()
+        return s, e, self.get_restored_frontier()
+
+    def get_restored_frontier(self) -> int:
+        if not self.restored_map:
+            return -1
+        frontier = -1
+        for i, ok in enumerate(self.restored_map):
+            if not ok:
+                break
+            frontier = i
+        return frontier
+
+    def count_hints(self) -> Tuple[int, int, int]:
+        n_gpu = 0
+        n_host = 0
+        n_missing = 0
+        for hint in self.storage_hint.values():
+            if hint == RecoveryStorageHint.GPU_RESIDENT:
+                n_gpu += 1
+            elif hint == RecoveryStorageHint.HOST_STORED:
+                n_host += 1
+            elif hint == RecoveryStorageHint.MISSING_RECOMPUTE:
+                n_missing += 1
+        return n_gpu, n_host, n_missing
+
+    def first_host_block(self) -> Optional[int]:
+        for idx in sorted(self.storage_hint.keys()):
+            if self.storage_hint[idx] == RecoveryStorageHint.HOST_STORED:
+                return idx
+        return None
+
+    def needs_recovery(self) -> bool:
+        for idx, hint in self.storage_hint.items():
+            if hint == RecoveryStorageHint.HOST_STORED:
+                return True
+            if hint == RecoveryStorageHint.MISSING_RECOMPUTE:
+                if idx < len(self.restored_map) and not self.restored_map[idx]:
+                    return True
+                if idx >= len(self.restored_map):
+                    return True
+        return False
+
+    def has_missing_recompute(self) -> bool:
+        for hint in self.storage_hint.values():
+            if hint == RecoveryStorageHint.MISSING_RECOMPUTE:
+                return True
+        return False
+
+    def has_host_stored(self) -> bool:
+        for hint in self.storage_hint.values():
+            if hint == RecoveryStorageHint.HOST_STORED:
+                return True
+        return False
+
+    def recompute_step(self, delta_tokens: int, block_size: int,
+                       total_tokens: int) -> Tuple[int, int, int]:
+        before = self.rec_frontier
+        if delta_tokens <= 0 or total_tokens <= 0:
+            return before, before, 0
+        end = min(before + delta_tokens, total_tokens)
+        if end <= before:
+            return before, before, 0
+        _ = block_size  # Keep signature stable for callers.
+        return before, end, end - before
+
+    def note_progress(self) -> None:
+        self.last_progress_ts_ns = time.time_ns()
+
+
+@dataclass
+class RecoveryObsState:
+    mode: RecoveryMode = RecoveryMode.NORMAL
+    mode_enter_ts_ns: int = 0
+    preempt_cnt: int = 0
+    last_restore_progress_ts_ns: int = 0
+    swapin_blocks_total: int = 0
+    swapout_blocks_total: int = 0
+    recompute_tokens_total: int = 0
+    restore_frontier: int = -1
+    swap_frontier: int = -1
+
+    def __post_init__(self) -> None:
+        if self.mode_enter_ts_ns == 0:
+            self.mode_enter_ts_ns = time.time_ns()
+
+
 class Sequence:
     """Stores the data, status, and block information of a sequence.
 
@@ -446,10 +686,18 @@ class Sequence:
         self.read_offset = 0
         # Input + output tokens
         self.tokens: Optional[List[str]] = None
+        self.recovery_obs = RecoveryObsState()
+        self.recovery_state = RecoveryState()
 
     @property
     def n_blocks(self) -> int:
         return (self.get_len() + self.block_size - 1) // self.block_size
+
+    def ensure_recovery_blocks(self) -> None:
+        try:
+            self.recovery_state.ensure_blocks(self.n_blocks)
+        except Exception:
+            pass
 
     @property
     def prompt(self) -> Optional[str]:
@@ -560,6 +808,17 @@ class Sequence:
     def reset_state_for_recompute(self):
         """Reset the sequence states for recomputation."""
         self.data.reset_state_for_recompute()
+        try:
+            self.recovery_state.recovery_enabled = True
+            self.recovery_state.mode = RecoveryMode.RECOVERY
+            self.recovery_state.ensure_blocks(self.n_blocks)
+            self.recovery_state.reset_restored_map(self.n_blocks)
+            self.recovery_state.mark_all(RecoveryStorageHint.MISSING_RECOMPUTE)
+            self.recovery_state.swap_frontier = 0
+            self.recovery_state.rec_frontier = 0
+            self.recovery_state.note_progress()
+        except Exception:
+            pass
 
     def append_token_id(self, token_id: int, logprobs: Dict[int,
                                                             Logprob]) -> None:
@@ -681,7 +940,6 @@ class SequenceGroup:
                                       first_scheduled_time=None,
                                       first_token_time=None,
                                       time_in_queue=None)
-        self.recovery_obs = RecoveryObsState()
         self.lora_request = lora_request
         self.prompt_logprobs: Optional[PromptLogprobs] = None
         self.state = SequenceGroupState()
