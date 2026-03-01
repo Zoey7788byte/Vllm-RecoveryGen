@@ -1,8 +1,11 @@
 """A block manager that manages token blocks."""
+import time
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 from typing import Sequence as GenericSequence
 from typing import Tuple
 
+from vllm import envs
 from vllm.core.block.block_table import BlockTable
 from vllm.core.block.cpu_gpu_block_allocator import CpuGpuBlockAllocator
 from vllm.core.block.interfaces import Block
@@ -10,14 +13,25 @@ from vllm.core.block.prefix_caching_block import (ComputedBlocksTracker,
                                                   LastAccessBlocksTracker)
 from vllm.core.block.utils import check_no_caching_or_swa_for_blockmgr_encdec
 from vllm.core.interfaces import AllocStatus, BlockSpaceManager
+from vllm.recovery.cost_model import observe_swap_task
 from vllm.recovery.observability import (add_restore_commit, add_swap_in,
-                                         add_swap_out, log_recovery_event)
+                                         add_swap_micro, add_swap_out,
+                                         log_recovery_event)
 from vllm.sequence import (RecoveryMode, RecoveryStorageHint, Sequence,
                            SequenceGroup, SequenceStatus)
 from vllm.utils import Device
 
 SeqId = int
 EncoderSeqId = str
+
+
+@dataclass
+class _SwapPrefetchEntry:
+    request_id: str
+    seq_id: int
+    indices: List[int]
+    cpu_block_ids: List[int]
+    created_ts_ns: int
 
 
 class SelfAttnBlockSpaceManager(BlockSpaceManager):
@@ -107,6 +121,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             self.block_allocator, self.block_size, self.enable_caching)
         self._last_access_blocks_tracker = LastAccessBlocksTracker(
             self.block_allocator)
+        self._recovery_prefetch_max_blocks = max(
+            0, int(envs.REC_PREFETCH_MAX_BLOCKS))
+        self._swap_prefetch: Dict[int, _SwapPrefetchEntry] = {}
+        self._swap_prefetch_blocks_total = 0
 
     def can_allocate(self,
                      seq_group: SequenceGroup,
@@ -322,6 +340,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         if seq_id not in self.block_tables:
             # Already freed or haven't been scheduled yet.
+            self._drop_prefetch_entry(seq_id)
             return
 
         # Update seq block ids with the latest access time
@@ -335,6 +354,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         # Free table/blocks
         self.block_tables[seq_id].free()
         del self.block_tables[seq_id]
+        self._drop_prefetch_entry(seq_id)
 
     def free_cross(self, seq_group: SequenceGroup) -> None:
         request_id = seq_group.request_id
@@ -407,6 +427,154 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
         # Track child seq
         self._last_access_blocks_tracker.add_seq(child_seq.seq_id)
+
+    def _drop_prefetch_entry(self, seq_id: int) -> None:
+        entry = self._swap_prefetch.pop(seq_id, None)
+        if entry is None:
+            return
+        self._swap_prefetch_blocks_total = max(
+            0, self._swap_prefetch_blocks_total - len(entry.indices))
+
+    def _collect_swap_candidate_indices(
+            self, seq: Sequence, blocks: List[Block],
+            max_to_swap: int) -> Tuple[List[int], int]:
+        if max_to_swap <= 0:
+            return [], 0
+        indices: List[int] = []
+        skipped_already_restored = 0
+        try:
+            start = max(0, seq.recovery_state.swap_frontier)
+            for idx in range(start, len(blocks)):
+                if len(indices) >= max_to_swap:
+                    break
+                if seq.recovery_state.storage_hint.get(
+                        idx) == RecoveryStorageHint.HOST_STORED:
+                    if (idx < len(seq.recovery_state.restored_map)
+                            and seq.recovery_state.restored_map[idx]):
+                        skipped_already_restored += 1
+                        continue
+                    indices.append(idx)
+            if not indices and seq.recovery_state.storage_hint:
+                for idx in range(0, len(blocks)):
+                    if len(indices) >= max_to_swap:
+                        break
+                    if seq.recovery_state.storage_hint.get(
+                            idx) == RecoveryStorageHint.HOST_STORED:
+                        if (idx < len(seq.recovery_state.restored_map)
+                                and seq.recovery_state.restored_map[idx]):
+                            skipped_already_restored += 1
+                            continue
+                        indices.append(idx)
+        except Exception:
+            indices = list(range(0, min(len(blocks), max_to_swap)))
+        return indices, skipped_already_restored
+
+    def _consume_prefetched_indices(
+            self, seq: Sequence, blocks: List[Block],
+            max_to_swap: int) -> Tuple[List[int], int, Optional[float]]:
+        entry = self._swap_prefetch.get(seq.seq_id)
+        if entry is None:
+            return [], 0, None
+        now_ns = time.time_ns()
+        prefetch_age_ms = max(0.0, (now_ns - entry.created_ts_ns) / 1e6)
+        valid_pairs: List[Tuple[int, int]] = []
+        skipped_already_restored = 0
+        for idx, cpu_block_id in zip(entry.indices, entry.cpu_block_ids):
+            if idx >= len(blocks):
+                skipped_already_restored += 1
+                continue
+            if blocks[idx].block_id != cpu_block_id:
+                skipped_already_restored += 1
+                continue
+            if seq.recovery_state.storage_hint.get(
+                    idx) != RecoveryStorageHint.HOST_STORED:
+                skipped_already_restored += 1
+                continue
+            if (idx < len(seq.recovery_state.restored_map)
+                    and seq.recovery_state.restored_map[idx]):
+                skipped_already_restored += 1
+                continue
+            valid_pairs.append((idx, cpu_block_id))
+
+        take_pairs = valid_pairs[:max_to_swap]
+        remain_pairs = valid_pairs[max_to_swap:]
+        old_count = len(entry.indices)
+        if remain_pairs:
+            entry.indices = [idx for idx, _ in remain_pairs]
+            entry.cpu_block_ids = [cpu_id for _, cpu_id in remain_pairs]
+            self._swap_prefetch_blocks_total = max(
+                0, self._swap_prefetch_blocks_total + len(remain_pairs) -
+                old_count)
+        else:
+            self._drop_prefetch_entry(seq.seq_id)
+        return [idx for idx, _ in take_pairs], skipped_already_restored, prefetch_age_ms
+
+    def prefetch_swap_in(self,
+                         seq_group: SequenceGroup,
+                         k_prefetch_max: Optional[int] = None) -> int:
+        if self._recovery_prefetch_max_blocks <= 0:
+            return 0
+        remaining_global = (self._recovery_prefetch_max_blocks -
+                            self._swap_prefetch_blocks_total)
+        if remaining_global <= 0:
+            return 0
+        limit = remaining_global
+        if k_prefetch_max is not None:
+            limit = min(limit, max(0, int(k_prefetch_max)))
+        if limit <= 0:
+            return 0
+
+        total_ready = 0
+        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+            if limit <= 0:
+                break
+            if seq.seq_id in self._swap_prefetch:
+                continue
+            block_table = self.block_tables.get(seq.seq_id)
+            if block_table is None:
+                continue
+            blocks = block_table.blocks
+            if len(blocks) == 0:
+                continue
+            try:
+                seq.recovery_state.align_to_num_blocks(len(blocks))
+            except Exception:
+                pass
+            max_to_prefetch = min(limit, len(blocks))
+            indices, _ = self._collect_swap_candidate_indices(
+                seq, blocks, max_to_prefetch)
+            if not indices:
+                continue
+            cpu_block_ids = [blocks[idx].block_id for idx in indices]
+            if not cpu_block_ids:
+                continue
+            created_ts_ns = time.time_ns()
+            self._swap_prefetch[seq.seq_id] = _SwapPrefetchEntry(
+                request_id=seq_group.request_id,
+                seq_id=seq.seq_id,
+                indices=list(indices),
+                cpu_block_ids=list(cpu_block_ids),
+                created_ts_ns=created_ts_ns,
+            )
+            ready = len(indices)
+            self._swap_prefetch_blocks_total += ready
+            total_ready += ready
+            limit -= ready
+            try:
+                log_recovery_event(
+                    "SWAP_PREFETCH_READY",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "k_ready": ready,
+                        "prefetch_blocks_total": self._swap_prefetch_blocks_total,
+                        "prefetch_max_blocks": self._recovery_prefetch_max_blocks,
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+        return total_ready
 
     def can_swap_in(self,
                     seq_group: SequenceGroup,
@@ -484,42 +652,33 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 continue
             indices: List[int] = []
             skipped_already_restored = 0
-            try:
-                start = max(0, seq.recovery_state.swap_frontier)
-                for idx in range(start, len(blocks)):
-                    if len(indices) >= max_to_swap:
-                        break
-                    if seq.recovery_state.storage_hint.get(
-                            idx) == RecoveryStorageHint.HOST_STORED:
-                        if (idx < len(seq.recovery_state.restored_map)
-                                and seq.recovery_state.restored_map[idx]):
-                            skipped_already_restored += 1
-                            continue
-                        indices.append(idx)
-                if not indices and seq.recovery_state.storage_hint:
-                    for idx in range(0, len(blocks)):
-                        if len(indices) >= max_to_swap:
-                            break
-                        if seq.recovery_state.storage_hint.get(
-                                idx) == RecoveryStorageHint.HOST_STORED:
-                            if (idx < len(seq.recovery_state.restored_map)
-                                    and seq.recovery_state.restored_map[idx]):
-                                skipped_already_restored += 1
-                                continue
-                            indices.append(idx)
-            except Exception:
-                indices = list(range(0, min(len(blocks), max_to_swap)))
+            prefetch_hit = False
+            prefetch_age_ms: Optional[float] = None
+            prefetched_indices, prefetch_skipped, prefetch_age_ms = (
+                self._consume_prefetched_indices(seq, blocks, max_to_swap))
+            if prefetched_indices:
+                indices = prefetched_indices
+                skipped_already_restored += prefetch_skipped
+                prefetch_hit = True
+            else:
+                indices, skipped_scan = self._collect_swap_candidate_indices(
+                    seq, blocks, max_to_swap)
+                skipped_already_restored += (prefetch_skipped + skipped_scan)
             if not indices:
                 continue
             blocks_to_swap = [blocks[idx] for idx in indices]
             k_req = len(blocks_to_swap)
             requested_cpu_block_ids = [blk.block_id for blk in blocks_to_swap]
+            swap_start = time.perf_counter()
             seq_swap_mapping = self.block_allocator.swap(
                 blocks=blocks_to_swap,
                 src_device=Device.CPU,
                 dst_device=Device.GPU,
             )
             k_done = len(seq_swap_mapping)
+            swap_task_ms = max(0.0, (time.perf_counter() - swap_start) * 1000.0)
+            if k_done > 0:
+                observe_swap_task(swap_task_ms, k_done)
             if k_done <= 0:
                 continue
 
@@ -591,6 +750,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             except Exception:
                 pass
             try:
+                add_swap_micro(1)
                 log_recovery_event(
                     "SWAP_IN_MICRO",
                     req_id=seq_group.request_id,
@@ -598,6 +758,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                     detail={
                         "k_req": k_req,
                         "k_done": k_done,
+                        "prefetch_hit": int(prefetch_hit),
+                        "prefetch_age_ms": (
+                            round(prefetch_age_ms, 3)
+                            if (prefetch_hit and prefetch_age_ms is not None)
+                            else None),
                     },
                     block_manager=self,
                 )

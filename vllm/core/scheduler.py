@@ -13,8 +13,11 @@ from vllm.core.interfaces import AllocStatus, BlockSpaceManager
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
-from vllm.recovery.observability import (RecoveryObservability,
-                                         get_recovery_config,
+from vllm.recovery.budget_controller import BudgetController, BudgetSignals
+from vllm.recovery.cost_model import (get_cost_model_snapshot,
+                                      observe_recompute_task)
+from vllm.recovery.observability import (RecoveryObservability, add_over_budget_drop,
+                                         add_recompute, get_recovery_config,
                                          log_recovery_event)
 from vllm.sequence import (RecoveryMode, Sequence, SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta,
@@ -297,6 +300,19 @@ class SchedulerPrefillOutputs:
         )
 
 
+@dataclass
+class _RecoveryTask:
+    kind: str
+    seq_group: SequenceGroup
+    seq: Optional[Sequence]
+    est_cost_ms: float
+    gain_density: float
+    priority: float
+    delta_tokens: int = 0
+    remaining_host_blocks: int = 0
+    stalled: bool = False
+
+
 def seq_group_metadata_builder():
     return SequenceGroupMetadata(request_id="",
                                  is_prompt=False,
@@ -397,6 +413,17 @@ class Scheduler:
         self._recovery_obs = RecoveryObservability()
         self._recovery_stall_logged_ns: Dict[int, int] = {}
         self._recovery_cfg = get_recovery_config()
+        self._recovery_last_cycle_wall_ms: float = 0.0
+        self._recovery_last_budget_blocks: int = 0
+        self._recovery_last_budget_ms: float = 0.0
+        self._recovery_last_slack_ms_est: float = 0.0
+        self._recovery_last_seq_slack_est: int = 0
+        self._recovery_last_token_slack_est: int = 0
+        self._recovery_last_online_load_est: int = 0
+        self._recovery_budget_ms_state: float = 0.0
+        self._recovery_online_only_pass: bool = False
+        self._recovery_budget_controller = BudgetController(self._recovery_cfg)
+        self._recovery_last_budget_target_ms: float = 0.0
 
         # Used to cache python objects
         self._seq_group_metadata_cache: List[PyObjectCache] = []
@@ -720,20 +747,41 @@ class Scheduler:
         infeasible_seq_groups: List[SequenceGroup] = []
 
         swapped_queue = self.swapped
-        k_swap_max = self._recovery_cfg.budget
-        if k_swap_max <= 0:
-            k_swap_max = 1
+        k_budget_total = self._estimate_recovery_swap_budget(budget)
+        k_budget_remaining = k_budget_total
+        if (not self._recovery_online_only_pass) and k_budget_total <= 0 and len(
+                swapped_queue) > 0:
+            add_over_budget_drop(len(swapped_queue))
 
         leftover_swapped: Deque[SequenceGroup] = deque()
         while swapped_queue:
             seq_group = swapped_queue[0]
+            needs_recovery = False
+            for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+                if seq.recovery_state.needs_recovery():
+                    needs_recovery = True
+                    break
+            if needs_recovery and k_budget_remaining <= 0:
+                if self._recovery_online_only_pass:
+                    try:
+                        prefetch_fn = getattr(self.block_manager,
+                                              "prefetch_swap_in", None)
+                        if callable(prefetch_fn):
+                            prefetch_fn(seq_group, k_prefetch_max=4)
+                    except Exception:
+                        pass
+                swapped_queue.popleft()
+                leftover_swapped.appendleft(seq_group)
+                if not self._recovery_online_only_pass:
+                    add_over_budget_drop(1)
+                continue
 
             # If the sequence group cannot be swapped in, stop.
             is_prefill = seq_group.is_prefill()
             alloc_status = self.block_manager.can_swap_in(
                 seq_group,
                 self._get_num_lookahead_slots(is_prefill, enable_chunking),
-                k_swap_max=k_swap_max)
+                k_swap_max=(k_budget_remaining if needs_recovery else 0))
             if alloc_status == AllocStatus.LATER:
                 break
             elif alloc_status == AllocStatus.NEVER:
@@ -762,7 +810,9 @@ class Scheduler:
 
             k_done, fully_restored = self._swap_in(seq_group,
                                                    blocks_to_swap_in,
-                                                   k_swap_max)
+                                                   (k_budget_remaining
+                                                    if needs_recovery else 0))
+            k_budget_remaining = max(0, k_budget_remaining - max(0, k_done))
             if not fully_restored:
                 if k_done == 0:
                     break
@@ -810,6 +860,10 @@ class Scheduler:
             )
             budget.add_num_seqs(seq_group.request_id, num_new_seqs)
 
+        if (not self._recovery_online_only_pass) and k_budget_remaining == 0:
+            dropped = len(swapped_queue) + len(leftover_swapped)
+            if dropped > 0:
+                add_over_budget_drop(dropped)
         swapped_queue.extendleft(leftover_swapped)
 
         return SchedulerSwappedInOutputs(
@@ -821,6 +875,104 @@ class Scheduler:
                 is_prefill=False, enable_chunking=enable_chunking),
             infeasible_seq_groups=infeasible_seq_groups,
         )
+
+    def _estimate_recovery_swap_budget(self, budget: SchedulingBudget) -> int:
+        cfg = self._recovery_cfg
+        fallback_budget = cfg.budget if cfg.budget > 0 else 1
+        manual_budget_cap = cfg.budget if cfg.budget > 1 else 0
+        phase2_enabled = (cfg.budget == 1) or (cfg.phase >= 2 and cfg.budget != 0)
+        online_load = len(self.waiting) + len(self.running) + len(self.swapped)
+        seq_slack = max(0, self.scheduler_config.max_num_seqs - budget.num_curr_seqs)
+        token_slack = max(0,
+                          self.scheduler_config.max_num_batched_tokens -
+                          budget.num_batched_tokens)
+        self._recovery_last_online_load_est = online_load
+        self._recovery_last_seq_slack_est = seq_slack
+        self._recovery_last_token_slack_est = token_slack
+        if self._recovery_online_only_pass:
+            self._recovery_last_budget_blocks = 0
+            self._recovery_last_budget_ms = 0.0
+            self._recovery_last_slack_ms_est = 0.0
+            return 0
+
+        # Phase0/1 compatibility: fixed swap budget behavior.
+        if not phase2_enabled:
+            self._recovery_last_budget_blocks = fallback_budget
+            self._recovery_last_budget_ms = fallback_budget * cfg.swap_ms_per_block
+            self._recovery_last_slack_ms_est = 0.0
+            return fallback_budget
+
+        if len(self.swapped) == 0:
+            self._recovery_last_budget_blocks = 0
+            self._recovery_last_budget_ms = 0.0
+            self._recovery_last_slack_ms_est = 0.0
+            return 0
+
+        # Phase2: derive recovery budget from slack and apply smooth hysteresis.
+        last_cycle_ms = self._recovery_last_cycle_wall_ms
+        if last_cycle_ms <= 0:
+            last_cycle_ms = cfg.target_cycle_ms * 0.8
+        slack_ms = max(0.0, cfg.target_cycle_ms - last_cycle_ms)
+
+        target_budget_ms = max(cfg.budget_min_ms, slack_ms)
+        if seq_slack <= 0 or token_slack <= 0:
+            target_budget_ms = cfg.budget_min_ms
+
+        if self._recovery_budget_ms_state <= 0:
+            self._recovery_budget_ms_state = max(cfg.budget_init_ms,
+                                                 cfg.budget_min_ms)
+
+        if target_budget_ms > self._recovery_budget_ms_state:
+            self._recovery_budget_ms_state += min(cfg.dplus_ms,
+                                                  target_budget_ms -
+                                                  self._recovery_budget_ms_state)
+        else:
+            self._recovery_budget_ms_state -= min(cfg.dminus_ms,
+                                                  self._recovery_budget_ms_state -
+                                                  target_budget_ms)
+        self._recovery_budget_ms_state = max(cfg.budget_min_ms,
+                                             self._recovery_budget_ms_state)
+
+        est_blocks = int(self._recovery_budget_ms_state / cfg.swap_ms_per_block)
+        est_blocks = max(cfg.min_budget, est_blocks)
+        if manual_budget_cap > 0:
+            est_blocks = min(est_blocks, manual_budget_cap)
+        est_blocks = max(0, est_blocks)
+        budget_ms = est_blocks * cfg.swap_ms_per_block
+
+        self._recovery_last_budget_blocks = est_blocks
+        self._recovery_last_budget_ms = budget_ms
+        self._recovery_last_slack_ms_est = slack_ms
+        try:
+            log_recovery_event(
+                "RECOVERY_BUDGET_DECISION",
+                detail={
+                    "phase": cfg.phase,
+                    "phase2_enabled": int(phase2_enabled),
+                    "k_swap_max": est_blocks,
+                    "budget_ms": round(budget_ms, 3),
+                    "budget_ms_target": round(target_budget_ms, 3),
+                    "budget_ms_state": round(self._recovery_budget_ms_state, 3),
+                    "slack_ms_est": round(slack_ms, 3),
+                    "last_cycle_wall_ms": round(self._recovery_last_cycle_wall_ms,
+                                                3),
+                    "target_cycle_ms": round(cfg.target_cycle_ms, 3),
+                    "swap_ms_per_block": cfg.swap_ms_per_block,
+                    "min_budget": cfg.min_budget,
+                    "budget_min_ms": cfg.budget_min_ms,
+                    "budget_init_ms": cfg.budget_init_ms,
+                    "dplus_ms": cfg.dplus_ms,
+                    "dminus_ms": cfg.dminus_ms,
+                    "manual_budget_cap": manual_budget_cap,
+                    "online_load_est": online_load,
+                    "seq_slack_est": seq_slack,
+                    "token_slack_est": token_slack,
+                },
+                block_manager=self.block_manager,
+            )
+        except Exception:
+            pass
+        return est_blocks
 
     def _get_prompt_limit(self, seq_group: SequenceGroup) -> int:
         if self.scheduler_config.chunked_prefill_enabled and \
@@ -1331,7 +1483,8 @@ class Scheduler:
         # such as self.running, self.swapped, and self.waiting.
         cycle_start_wall = time.time()
         self._recovery_obs.on_cycle_begin(cycle_start_wall)
-        self._run_recovery_micro_tasks()
+        online_first_phase2 = self._is_phase2_online_first_enabled()
+        self._recovery_online_only_pass = online_first_phase2
         scheduler_start_time = time.perf_counter()
 
         scheduler_outputs: SchedulerOutputs = self._schedule()
@@ -1454,58 +1607,14 @@ class Scheduler:
                 allow_async_output_proc = self._allow_async_output_proc(
                     seq_group)
 
-            if is_prompt:
+            if is_prompt and (not online_first_phase2):
                 for seq in seq_group.get_seqs():
                     if not (seq.recovery_state.recovery_enabled
                             and seq.recovery_state.has_missing_recompute()
                             and (not seq.recovery_state.has_host_stored())):
                         continue
-                    before, after, delta_done = seq.recovery_state.recompute_step(
-                        token_chunk_size,
-                        seq.block_size,
-                        seq.get_len(),
-                    )
-                    try:
-                        log_recovery_event(
-                            "RECOMPUTE_MICRO",
-                            req_id=seq_group.request_id,
-                            seq_id=seq.seq_id,
-                            detail={
-                                "delta_req": token_chunk_size,
-                                "delta_done": delta_done,
-                                "rec_frontier_before": before,
-                                "rec_frontier_after": after,
-                            },
-                            block_manager=self.block_manager,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        if delta_done > 0:
-                            start_block = before // seq.block_size
-                            end_block = ((after - 1) // seq.block_size
-                                         if after > 0 else start_block)
-                            commit_start, commit_end, new_frontier = (
-                                seq.recovery_state.commit_progress(
-                                    "recompute",
-                                    start_block,
-                                    end_block + 1,
-                                    token_after=after,
-                                ))
-                            log_recovery_event(
-                                "RECOVERY_PROGRESS_COMMIT",
-                                req_id=seq_group.request_id,
-                                seq_id=seq.seq_id,
-                                detail={
-                                    "kind": "recompute",
-                                    "range": [commit_start, commit_end],
-                                    "tokens_committed": delta_done,
-                                    "new_frontier": new_frontier,
-                                },
-                                block_manager=self.block_manager,
-                            )
-                    except Exception:
-                        pass
+                    self._execute_recompute_micro_task(seq_group, seq,
+                                                       token_chunk_size)
 
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
@@ -1532,8 +1641,105 @@ class Scheduler:
         # Move to next cache (if exists)
         self.cache_id = self.next_cache_id
 
-        # Observability: cycle boundary summary (Phase0)
+        # Phase2 hard boundary: run online scheduling first, then use slack for
+        # recovery micro-tasks only in tail stage.
+        t_on_ms = max(0.0, (time.time() - cycle_start_wall) * 1000.0)
+        t_cyc_target_ms = float(self._recovery_cfg.target_cycle_ms)
+        raw_s_ms = max(0.0, t_cyc_target_ms - t_on_ms)
+        slack_forced_zero = 0
+        slack_escape_hatch = 0
+        stalled = False
+        high_load = (len(self.waiting) > 0 or scheduler_outputs.preempted > 0)
+        if online_first_phase2:
+            stalled = self._has_stalled_recovery(time.time_ns())
+        # In high-load cycles (queue pressure or fresh preemptions), treat
+        # slack as unavailable to protect online path and suppress oscillation.
+        if online_first_phase2 and high_load:
+            s_ms = 0.0
+            slack_forced_zero = 1
+            # Escape hatch: when recovery is stalled, grant a tiny budget so
+            # progress can continue and long swap-in gaps are capped.
+            if stalled:
+                s_ms = min(raw_s_ms, max(1e-3, self._recovery_cfg.budget_min_ms))
+                if s_ms > 0.0:
+                    slack_forced_zero = 0
+                    slack_escape_hatch = 1
+        else:
+            s_ms = raw_s_ms
+        recovery_overhead_ms = 0.0
+        budget_target_ms = self._recovery_last_budget_target_ms
+        budget_exec_ms = self._recovery_last_budget_ms
+        if online_first_phase2:
+            free_gpu_blocks = 0
+            total_gpu_blocks = getattr(self.block_manager, "num_total_gpu_blocks", 0)
+            try:
+                free_gpu_blocks = self.block_manager.get_num_free_gpu_blocks()
+            except Exception:
+                free_gpu_blocks = 0
+            decision = self._recovery_budget_controller.update(
+                BudgetSignals(
+                    slack_ms=s_ms,
+                    preempt_delta=scheduler_outputs.preempted,
+                    free_kv_blocks=free_gpu_blocks,
+                    total_kv_blocks=total_gpu_blocks,
+                    waiting_len=len(self.waiting),
+                    stalled=stalled,
+                ))
+            budget_target_ms = float(decision["B_target_ms"])
+            budget_exec_ms = float(decision["B_ms"])
+            self._recovery_last_budget_target_ms = budget_target_ms
+            self._recovery_last_budget_ms = budget_exec_ms
+            try:
+                log_recovery_event(
+                    "CYCLE_SLACK_COMPUTED",
+                    cycle_id=self._recovery_obs.cycle_id,
+                    detail={
+                        "T_on_ms": round(t_on_ms, 3),
+                        "raw_S_ms": round(raw_s_ms, 3),
+                        "S_ms": round(s_ms, 3),
+                        "T_cyc_ms": round(t_cyc_target_ms, 3),
+                        "slack_forced_zero": slack_forced_zero,
+                        "slack_escape_hatch": slack_escape_hatch,
+                    },
+                    block_manager=self.block_manager,
+                )
+            except Exception:
+                pass
+            try:
+                log_recovery_event(
+                    "RECOVERY_BUDGET_DECISION",
+                    cycle_id=self._recovery_obs.cycle_id,
+                    detail={
+                        "phase": self._recovery_cfg.phase,
+                        "B_target_ms": budget_target_ms,
+                        "B_ms": budget_exec_ms,
+                        "S_ms": round(s_ms, 3),
+                        "raw_S_ms": round(raw_s_ms, 3),
+                        "slack_forced_zero": slack_forced_zero,
+                        "slack_escape_hatch": slack_escape_hatch,
+                        "preempt_delta": scheduler_outputs.preempted,
+                        "waiting_len": len(self.waiting),
+                        "free_kv_blocks": free_gpu_blocks,
+                        "total_kv_blocks": total_gpu_blocks,
+                        "stalled": int(stalled),
+                        "pressure_state": decision["pressure_state"],
+                        "delta_ms": decision["delta_ms"],
+                        "free_ratio": decision["free_ratio"],
+                        "free_ema": decision["free_ema"],
+                        "preempt_ema": decision["preempt_ema"],
+                    },
+                    block_manager=self.block_manager,
+                )
+            except Exception:
+                pass
+            if budget_exec_ms > 0.0:
+                _, recovery_overhead_ms = self._run_recovery_tail_micro_tasks(
+                    budget_exec_ms, scheduler_outputs.blocks_to_swap_in)
+        self._recovery_online_only_pass = False
+
+        # Observability: cycle boundary summary (Phase0/1/2)
         cycle_end_wall = time.time()
+        cycle_ctx: Dict[str, Union[int, float, str]] = {}
         try:
             num_scheduled = len(scheduler_outputs.scheduled_seq_groups)
             num_prefill = scheduler_outputs.num_prefill_groups
@@ -1570,12 +1776,50 @@ class Scheduler:
                 "running_len": len(self.running),
                 "swapped_len": len(self.swapped),
                 "preempted": scheduler_outputs.preempted,
+                "T_cyc_ms": round(t_cyc_target_ms, 3),
+                "T_on_ms": round(t_on_ms, 3),
+                "S_ms": round(s_ms, 3),
+                "raw_S_ms": round(raw_s_ms, 3),
+                "slack_forced_zero": slack_forced_zero,
+                "slack_escape_hatch": slack_escape_hatch,
+                "recovery_overhead_ms": round(recovery_overhead_ms, 3),
+                "recovery_budget_target_ms": round(budget_target_ms, 3),
+                "recovery_budget_blocks": self._recovery_last_budget_blocks,
+                "recovery_budget_ms": round(budget_exec_ms, 3),
+                "recovery_slack_ms_est": round(self._recovery_last_slack_ms_est, 3),
+                "recovery_online_load_est": self._recovery_last_online_load_est,
+                "recovery_seq_slack_est": self._recovery_last_seq_slack_est,
+                "recovery_token_slack_est": self._recovery_last_token_slack_est,
             }
             if swap_frontier_avg is not None:
                 cycle_ctx["swap_frontier_avg"] = swap_frontier_avg
             self._recovery_obs.on_cycle_end(cycle_end_wall, cycle_ctx)
         except Exception:
             self._recovery_obs.on_cycle_end(cycle_end_wall, None)
+        self._recovery_last_cycle_wall_ms = float(cycle_ctx.get("cycle_wall_ms", 0.0)
+                                                  or 0.0)
+
+        # Export cycle metrics into scheduler outputs for /metrics scraping.
+        try:
+            scheduler_outputs.recovery_swapin_blocks = int(
+                cycle_ctx.get("swapin_blocks", 0))
+            scheduler_outputs.recovery_swapout_blocks = int(
+                cycle_ctx.get("swapout_blocks", 0))
+            scheduler_outputs.recovery_recompute_tokens = int(
+                cycle_ctx.get("recompute_tokens", 0))
+            scheduler_outputs.recovery_restore_progress_stall_ms = float(
+                cycle_ctx.get("restore_progress_stall_ms_delta", 0.0))
+            scheduler_outputs.recovery_mode = str(cycle_ctx.get("mode", "normal"))
+            scheduler_outputs.recovery_mode_switches_cycle = int(
+                cycle_ctx.get("mode_switches_cycle", 0))
+            scheduler_outputs.recovery_online_load_est = int(
+                cycle_ctx.get("recovery_online_load_est", 0))
+            scheduler_outputs.recovery_seq_slack_est = int(
+                cycle_ctx.get("recovery_seq_slack_est", 0))
+            scheduler_outputs.recovery_token_slack_est = int(
+                cycle_ctx.get("recovery_token_slack_est", 0))
+        except Exception:
+            pass
 
         # Recovery stalled detection (Phase1 diagnostic only).
         try:
@@ -1618,6 +1862,245 @@ class Scheduler:
         Phase1: placeholder hook for future swap/recompute planning.
         """
         return
+
+    def _is_phase2_online_first_enabled(self) -> bool:
+        cfg = self._recovery_cfg
+        return (cfg.budget == 1) or (cfg.phase >= 2 and cfg.budget != 0)
+
+    def _execute_recompute_micro_task(self, seq_group: SequenceGroup, seq: Sequence,
+                                      delta_tokens: int) -> Tuple[int, float]:
+        rec_task_start = time.perf_counter()
+        before, after, delta_done = seq.recovery_state.recompute_step(
+            delta_tokens,
+            seq.block_size,
+            seq.get_len(),
+        )
+        add_recompute(tokens=delta_done, tasks=1)
+        try:
+            log_recovery_event(
+                "RECOMPUTE_MICRO",
+                req_id=seq_group.request_id,
+                seq_id=seq.seq_id,
+                detail={
+                    "delta_req": delta_tokens,
+                    "delta_done": delta_done,
+                    "rec_frontier_before": before,
+                    "rec_frontier_after": after,
+                },
+                block_manager=self.block_manager,
+            )
+        except Exception:
+            pass
+        try:
+            if delta_done > 0:
+                start_block = before // seq.block_size
+                end_block = ((after - 1) // seq.block_size
+                             if after > 0 else start_block)
+                commit_start, commit_end, new_frontier = (
+                    seq.recovery_state.commit_progress(
+                        "recompute",
+                        start_block,
+                        end_block + 1,
+                        token_after=after,
+                    ))
+                log_recovery_event(
+                    "RECOVERY_PROGRESS_COMMIT",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    detail={
+                        "kind": "recompute",
+                        "range": [commit_start, commit_end],
+                        "tokens_committed": delta_done,
+                        "new_frontier": new_frontier,
+                    },
+                    block_manager=self.block_manager,
+                )
+        except Exception:
+            pass
+        rec_task_ms = max(0.0, (time.perf_counter() - rec_task_start) * 1000.0)
+        if delta_done > 0:
+            observe_recompute_task(rec_task_ms, delta_done)
+        return delta_done, rec_task_ms
+
+    def _select_recovery_tasks(self, budget_ms: float) -> List[_RecoveryTask]:
+        now_ns = time.time_ns()
+        stall_threshold_ns = int(max(1.0, float(self._recovery_cfg.stall_ms)) * 1e6)
+        snapshot = get_cost_model_snapshot()
+        bar_t_swap = max(1e-6, float(snapshot.get("barT_swap_ms_per_block", 1.0)))
+        bar_t_rec = max(1e-6, float(snapshot.get("barT_rec_ms_per_token", 0.05)))
+        gain_swap = 1.0 / bar_t_swap
+        gain_rec = 1.0 / bar_t_rec
+        delta_tokens = RECOVERY_RECOMPUTE_DELTA_TOKENS
+
+        tasks: List[_RecoveryTask] = []
+        swap_group_task_idx: Dict[int, int] = {}
+        seen_groups: Set[int] = set()
+        for seq_group in list(self.waiting) + list(self.running) + list(self.swapped):
+            gid = id(seq_group)
+            if gid in seen_groups:
+                continue
+            seen_groups.add(gid)
+            for seq in seq_group.seqs:
+                if not seq.recovery_state.recovery_enabled:
+                    continue
+                if not seq.recovery_state.needs_recovery():
+                    continue
+                last_progress = seq.recovery_state.last_progress_ts_ns
+                stalled = (last_progress > 0 and
+                           (now_ns - last_progress) >= stall_threshold_ns)
+                preempt_cnt = 0
+                try:
+                    preempt_cnt = int(seq.recovery_obs.preempt_cnt)
+                except Exception:
+                    preempt_cnt = 0
+                # Longer stalls are prioritized; frequently re-preempted requests
+                # are restored more conservatively.
+                stalled_boost = 2.0 if stalled else 1.0
+                preempt_penalty = 1.0 / (1.0 + 0.1 * max(0, preempt_cnt))
+                weight = stalled_boost * preempt_penalty
+
+                if (seq.status == SequenceStatus.SWAPPED
+                        and seq.recovery_state.has_host_stored()):
+                    remaining_host = 0
+                    try:
+                        _, remaining_host, _ = seq.recovery_state.count_hints()
+                    except Exception:
+                        remaining_host = 0
+                    # Prefer finishing near-complete requests to reduce long
+                    # recovery gaps on tail blocks.
+                    finish_boost = 1.0 + (1.0 / max(1.0, float(remaining_host)))
+                    new_task = _RecoveryTask(
+                        kind="swap",
+                        seq_group=seq_group,
+                        seq=seq,
+                        est_cost_ms=bar_t_swap,
+                        gain_density=gain_swap,
+                        priority=weight * gain_swap * finish_boost,
+                        delta_tokens=0,
+                        remaining_host_blocks=max(0, remaining_host),
+                        stalled=stalled,
+                    )
+                    if gid not in swap_group_task_idx:
+                        swap_group_task_idx[gid] = len(tasks)
+                        tasks.append(
+                            new_task)
+                    else:
+                        old_idx = swap_group_task_idx[gid]
+                        old_task = tasks[old_idx]
+                        if ((new_task.stalled and not old_task.stalled)
+                                or (new_task.priority > old_task.priority)
+                                or (new_task.remaining_host_blocks <
+                                    old_task.remaining_host_blocks)):
+                            tasks[old_idx] = new_task
+                    continue
+
+                if (seq.recovery_state.has_missing_recompute()
+                        and (not seq.recovery_state.has_host_stored())):
+                    est_cost_ms = max(1e-6, bar_t_rec * float(delta_tokens))
+                    tasks.append(
+                        _RecoveryTask(
+                            kind="recompute",
+                            seq_group=seq_group,
+                            seq=seq,
+                            est_cost_ms=est_cost_ms,
+                            gain_density=gain_rec,
+                            priority=weight * gain_rec,
+                            delta_tokens=delta_tokens,
+                            stalled=stalled,
+                        ))
+
+        tasks.sort(
+            key=lambda t: (
+                0 if t.stalled else 1,
+                -t.priority,
+                t.est_cost_ms,
+            ))
+        if budget_ms <= 0.0:
+            return tasks
+        return tasks
+
+    def _has_stalled_recovery(self, now_ns: int) -> bool:
+        threshold_ns = int(max(1.0, float(self._recovery_cfg.stall_ms)) * 1e6)
+        for seq_group in list(self.waiting) + list(self.running) + list(
+                self.swapped):
+            for seq in seq_group.seqs:
+                if not seq.recovery_state.recovery_enabled:
+                    continue
+                if not seq.recovery_state.needs_recovery():
+                    continue
+                last_progress = seq.recovery_state.last_progress_ts_ns
+                if last_progress <= 0:
+                    continue
+                if now_ns - last_progress >= threshold_ns:
+                    return True
+        return False
+
+    def _run_recovery_tail_micro_tasks(
+            self, budget_ms: float,
+            blocks_to_swap_in: List[Tuple[int, int]]) -> Tuple[int, float]:
+        # Phase2: allow tail-stage recompute even when swapped queue is empty.
+        if budget_ms <= 0.0:
+            return 0, 0.0
+        start = time.perf_counter()
+        remaining_ms = max(0.0, float(budget_ms))
+        executed_tasks = 0
+
+        while remaining_ms > 0.0:
+            tasks = self._select_recovery_tasks(remaining_ms)
+            if not tasks:
+                break
+
+            executed_one = False
+            budget_blocked = 0
+            for task in tasks:
+                est_cost_ms = max(1e-6, float(task.est_cost_ms))
+                if remaining_ms < est_cost_ms:
+                    budget_blocked += 1
+                    continue
+                if task.kind == "swap":
+                    is_prefill = task.seq_group.is_prefill()
+                    alloc_status = self.block_manager.can_swap_in(
+                        task.seq_group,
+                        self._get_num_lookahead_slots(
+                            is_prefill, enable_chunking=False),
+                        k_swap_max=1)
+                    # For stalled recovery, allow a best-effort swap even if
+                    # allocator reports LATER; this helps shrink long gaps on
+                    # tail blocks without changing normal-path aggressiveness.
+                    if alloc_status == AllocStatus.NEVER:
+                        continue
+                    if alloc_status == AllocStatus.LATER and (not task.stalled):
+                        continue
+                    k_done, _ = self._swap_in(task.seq_group, blocks_to_swap_in, 1)
+                    if k_done <= 0:
+                        continue
+                    remaining_ms -= est_cost_ms
+                    executed_tasks += 1
+                    executed_one = True
+                    break
+                if task.kind == "recompute" and task.seq is not None:
+                    delta_done, task_ms = self._execute_recompute_micro_task(
+                        task.seq_group, task.seq, task.delta_tokens)
+                    if delta_done <= 0:
+                        continue
+                    remaining_ms -= max(est_cost_ms, task_ms)
+                    executed_tasks += 1
+                    executed_one = True
+                    break
+
+            if not executed_one:
+                # Count only budget-limited drops. If tasks are blocked by
+                # allocator state rather than remaining budget, avoid inflating
+                # the over_budget_drop metric.
+                if budget_blocked > 0:
+                    add_over_budget_drop(budget_blocked)
+                break
+
+        pending = len(self._select_recovery_tasks(0.0))
+        if pending > 0 and remaining_ms <= 0.0:
+            add_over_budget_drop(pending)
+
+        return executed_tasks, max(0.0, (time.perf_counter() - start) * 1000.0)
 
     def fork_seq(self, parent_seq: Sequence, child_seq: Sequence) -> None:
         self.block_manager.fork(parent_seq, child_seq)

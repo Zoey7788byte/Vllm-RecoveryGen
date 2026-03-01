@@ -6,6 +6,7 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from vllm import envs
+from vllm.recovery.cost_model import get_cost_model_snapshot
 
 
 def _coerce_bool(value: Any) -> Optional[bool]:
@@ -60,6 +61,15 @@ class RecoveryConfig:
     v2: int
     budget: int
     phase: int
+    min_budget: int
+    swap_ms_per_block: float
+    target_cycle_ms: float
+    stall_ms: float
+    budget_init_ms: float
+    budget_min_ms: float
+    dplus_ms: float
+    dminus_ms: float
+    prefetch_max_blocks: int
 
     @classmethod
     def from_env_or_json(cls) -> "RecoveryConfig":
@@ -71,6 +81,15 @@ class RecoveryConfig:
             "v2": envs.VLLM_RECOVERY_V2,
             "budget": envs.VLLM_RECOVERY_BUDGET,
             "phase": envs.VLLM_RECOVERY_PHASE,
+            "min_budget": envs.VLLM_RECOVERY_MIN_BUDGET,
+            "swap_ms_per_block": envs.VLLM_RECOVERY_SWAP_MS_PER_BLOCK,
+            "target_cycle_ms": envs.REC_T_CYC_MS,
+            "stall_ms": envs.REC_STALL_MS,
+            "budget_init_ms": envs.REC_BUDGET_INIT_MS,
+            "budget_min_ms": envs.REC_BUDGET_MIN_MS,
+            "dplus_ms": envs.REC_DPLUS_MS,
+            "dminus_ms": envs.REC_DMINUS_MS,
+            "prefetch_max_blocks": envs.REC_PREFETCH_MAX_BLOCKS,
         }
 
         json_cfg: Dict[str, Any] = {}
@@ -110,6 +129,66 @@ class RecoveryConfig:
                 v = _coerce_int(json_cfg.get("phase"))
                 if v is not None:
                     env_cfg["phase"] = v
+            if "min_budget" in json_cfg:
+                v = _coerce_int(json_cfg.get("min_budget"))
+                if v is not None:
+                    env_cfg["min_budget"] = v
+            if "swap_ms_per_block" in json_cfg:
+                v = json_cfg.get("swap_ms_per_block")
+                try:
+                    env_cfg["swap_ms_per_block"] = float(v)
+                except Exception:
+                    pass
+            if "target_cycle_ms" in json_cfg:
+                v = json_cfg.get("target_cycle_ms")
+                try:
+                    env_cfg["target_cycle_ms"] = float(v)
+                except Exception:
+                    pass
+            if "t_cyc_ms" in json_cfg:
+                v = json_cfg.get("t_cyc_ms")
+                try:
+                    env_cfg["target_cycle_ms"] = float(v)
+                except Exception:
+                    pass
+            if "stall_ms" in json_cfg:
+                v = json_cfg.get("stall_ms")
+                try:
+                    env_cfg["stall_ms"] = float(v)
+                except Exception:
+                    pass
+            if "b_min" in json_cfg:
+                v = _coerce_int(json_cfg.get("b_min"))
+                if v is not None:
+                    env_cfg["min_budget"] = v
+            if "budget_init_ms" in json_cfg:
+                v = json_cfg.get("budget_init_ms")
+                try:
+                    env_cfg["budget_init_ms"] = float(v)
+                except Exception:
+                    pass
+            if "budget_min_ms" in json_cfg:
+                v = json_cfg.get("budget_min_ms")
+                try:
+                    env_cfg["budget_min_ms"] = float(v)
+                except Exception:
+                    pass
+            if "dplus_ms" in json_cfg:
+                v = json_cfg.get("dplus_ms")
+                try:
+                    env_cfg["dplus_ms"] = float(v)
+                except Exception:
+                    pass
+            if "dminus_ms" in json_cfg:
+                v = json_cfg.get("dminus_ms")
+                try:
+                    env_cfg["dminus_ms"] = float(v)
+                except Exception:
+                    pass
+            if "prefetch_max_blocks" in json_cfg:
+                v = _coerce_int(json_cfg.get("prefetch_max_blocks"))
+                if v is not None:
+                    env_cfg["prefetch_max_blocks"] = v
 
         return cls(
             obs_enabled=bool(env_cfg["obs_enabled"]),
@@ -119,6 +198,15 @@ class RecoveryConfig:
             v2=int(env_cfg["v2"]),
             budget=int(env_cfg["budget"]),
             phase=int(env_cfg["phase"]),
+            min_budget=max(0, int(env_cfg["min_budget"])),
+            swap_ms_per_block=max(1e-6, float(env_cfg["swap_ms_per_block"])),
+            target_cycle_ms=max(1.0, float(env_cfg["target_cycle_ms"])),
+            stall_ms=max(1.0, float(env_cfg["stall_ms"])),
+            budget_init_ms=max(0.0, float(env_cfg["budget_init_ms"])),
+            budget_min_ms=max(0.0, float(env_cfg["budget_min_ms"])),
+            dplus_ms=max(0.0, float(env_cfg["dplus_ms"])),
+            dminus_ms=max(0.0, float(env_cfg["dminus_ms"])),
+            prefetch_max_blocks=max(0, int(env_cfg["prefetch_max_blocks"])),
         )
 
 
@@ -162,10 +250,14 @@ class _RecoveryEventLogger:
     # Phase0: keep JSONL sparse to avoid IO jitter on online path.
     _EVENT_ALLOWLIST = frozenset({
         "PREEMPT_TRIGGERED",
+        "CYCLE_SLACK_COMPUTED",
+        "RECOVERY_MODE_SWITCH",
+        "RECOVERY_BUDGET_DECISION",
         "RECOVERY_STATE_CREATED",
         "RECOMPUTE_MICRO",
         "RECOVERY_PROGRESS_COMMIT",
         "SWAP_IN_MICRO",
+        "SWAP_PREFETCH_READY",
         "SWAP_IN_SKIP_ALREADY_RESTORED",
         "RECOVERY_REMAINING_HOST_BLOCKS",
         "RECOVERY_STALLED",
@@ -210,10 +302,19 @@ class _RecoveryCsvLogger:
         "ts_ns",
         "t_rel_s",
         "cycle_id",
+        "T_cyc_ms",
         "on_preempt_count_delta",
         "on_waiting_len",
         "T_on_ms",
         "S_ms",
+        "B_ms",
+        "barT_swap",
+        "barT_rec",
+        "gain_swap",
+        "gain_rec",
+        "x_swap",
+        "x_rec",
+        "over_budget_drop",
         "swapin_blocks",
         "swapout_blocks",
         "recompute_tokens",
@@ -335,6 +436,10 @@ class CycleCounters:
     swapin_bytes: int = 0
     swapout_bytes: int = 0
     restore_commit_blocks: int = 0
+    x_swap: int = 0
+    x_rec: int = 0
+    recompute_tokens: int = 0
+    over_budget_drop: int = 0
 
     def reset(self) -> None:
         self.swapin_blocks = 0
@@ -342,6 +447,10 @@ class CycleCounters:
         self.swapin_bytes = 0
         self.swapout_bytes = 0
         self.restore_commit_blocks = 0
+        self.x_swap = 0
+        self.x_rec = 0
+        self.recompute_tokens = 0
+        self.over_budget_drop = 0
 
     def add_swap_in(self, blocks: int, bytes_count: Optional[int]) -> None:
         self.swapin_blocks += int(blocks)
@@ -355,6 +464,16 @@ class CycleCounters:
 
     def add_restore_commit(self, blocks: int) -> None:
         self.restore_commit_blocks += int(blocks)
+
+    def add_swap_micro(self, count: int = 1) -> None:
+        self.x_swap += int(count)
+
+    def add_recompute(self, tokens: int = 0, tasks: int = 1) -> None:
+        self.x_rec += int(tasks)
+        self.recompute_tokens += int(tokens)
+
+    def add_over_budget_drop(self, count: int = 1) -> None:
+        self.over_budget_drop += int(count)
 
 
 @lru_cache(maxsize=1)
@@ -378,6 +497,18 @@ def add_restore_commit(blocks: int) -> None:
     _get_cycle_counters().add_restore_commit(blocks)
 
 
+def add_swap_micro(count: int = 1) -> None:
+    _get_cycle_counters().add_swap_micro(count)
+
+
+def add_recompute(tokens: int = 0, tasks: int = 1) -> None:
+    _get_cycle_counters().add_recompute(tokens=tokens, tasks=tasks)
+
+
+def add_over_budget_drop(count: int = 1) -> None:
+    _get_cycle_counters().add_over_budget_drop(count)
+
+
 def get_cycle_counters_snapshot() -> Dict[str, int]:
     c = _get_cycle_counters()
     return {
@@ -386,6 +517,10 @@ def get_cycle_counters_snapshot() -> Dict[str, int]:
         "swapin_bytes": c.swapin_bytes,
         "swapout_bytes": c.swapout_bytes,
         "restore_commit_blocks_delta": c.restore_commit_blocks,
+        "x_swap": c.x_swap,
+        "x_rec": c.x_rec,
+        "recompute_tokens": c.recompute_tokens,
+        "over_budget_drop": c.over_budget_drop,
     }
 
 
@@ -438,9 +573,9 @@ class RecoveryObservability:
         swapin_blocks = int(cycle_context.get("swapin_blocks", 0))
         swapout_blocks = int(cycle_context.get("swapout_blocks", 0))
         swapped_len = int(cycle_context.get("swapped_len", 0))
-        if preempted > 0 or swapout_blocks > 0:
-            return "pressure"
-        if swapin_blocks > 0 or swapped_len > 0:
+        if swapped_len > 0 and self._stall_ms_proxy >= self._cfg.stall_ms:
+            return "fallback"
+        if preempted > 0 or swapout_blocks > 0 or swapin_blocks > 0 or swapped_len > 0:
             return "recovery"
         return "normal"
 
@@ -470,6 +605,7 @@ class RecoveryObservability:
         if cycle_context is None:
             cycle_context = {}
         cycle_context.update(get_cycle_counters_snapshot())
+        cycle_context.update(get_cost_model_snapshot())
         if duration_ms is not None:
             cycle_context["cycle_wall_ms"] = duration_ms
         else:
@@ -478,12 +614,14 @@ class RecoveryObservability:
 
         ts_ns = payload["ts_ns"]
         mode = self._resolve_mode(cycle_context)
+        mode_switches_cycle = 0
         if mode != self._mode:
             prev_mode = self._mode
             prev_mode_dwell_ms = max(0.0, (ts_ns - self._mode_enter_ns) / 1e6)
             self._mode = mode
             self._mode_enter_ns = ts_ns
             self._mode_switches += 1
+            mode_switches_cycle = 1
             log_recovery_event(
                 "RECOVERY_MODE_SWITCH",
                 cycle_id=self._cycle_id,
@@ -499,11 +637,13 @@ class RecoveryObservability:
         cycle_context["mode"] = self._mode
         cycle_context["mode_resident_ms"] = round(mode_resident_ms, 3)
         cycle_context["mode_switches"] = self._mode_switches
+        cycle_context["mode_switches_cycle"] = mode_switches_cycle
 
         swapped_len = int(cycle_context.get("swapped_len", 0))
         swapin_blocks = int(cycle_context.get("swapin_blocks", 0))
         has_recovery_pressure = swapped_len > 0 or self._prev_swapped_len > 0
         progressed = False
+        stall_delta_ms = 0.0
         if has_recovery_pressure:
             progressed = (swapin_blocks > 0 or swapped_len < self._prev_swapped_len)
             if progressed:
@@ -521,6 +661,7 @@ class RecoveryObservability:
             elif swapped_len > 0:
                 self._stall_cycles += 1
                 self._stall_ms_proxy += cycle_wall_ms
+                stall_delta_ms = cycle_wall_ms
                 if self._stall_cycles == 1 or self._stall_cycles % 10 == 0:
                     log_recovery_event(
                         "RECOVERY_STALL",
@@ -540,9 +681,11 @@ class RecoveryObservability:
         cycle_context["recovery_stall_cycles"] = self._stall_cycles
         cycle_context["restore_progress_stall_ms"] = round(self._stall_ms_proxy,
                                                            3)
-        cycle_context["mode_cnt_normal"] = 1
-        cycle_context["mode_cnt_recovery"] = 0
-        cycle_context["mode_cnt_fallback"] = 0
+        cycle_context["restore_progress_stall_ms_delta"] = round(stall_delta_ms,
+                                                                 3)
+        cycle_context["mode_cnt_normal"] = 1 if self._mode == "normal" else 0
+        cycle_context["mode_cnt_recovery"] = 1 if self._mode == "recovery" else 0
+        cycle_context["mode_cnt_fallback"] = 1 if self._mode == "fallback" else 0
 
         if cycle_context:
             payload["detail"] = cycle_context
@@ -550,12 +693,15 @@ class RecoveryObservability:
         try:
             recovery_overhead_ms = float(cycle_context.get("recovery_overhead_ms",
                                                            0.0))
-            t_on_ms = max(0.0, cycle_wall_ms - recovery_overhead_ms)
+            t_on_ms = float(cycle_context.get(
+                "T_on_ms", max(0.0, cycle_wall_ms - recovery_overhead_ms)))
             cycle_context["T_on_ms"] = round(t_on_ms, 3)
-            s_ms = max(0.0, cycle_wall_ms - t_on_ms)
+            s_ms = float(cycle_context.get("S_ms", max(0.0, cycle_wall_ms - t_on_ms)))
             row = {
                 "ts_ns": payload["ts_ns"],
                 "cycle_id": self._cycle_id,
+                "T_cyc_ms": round(float(cycle_context.get("T_cyc_ms",
+                                                          cycle_wall_ms)), 3),
                 "on_preempt_count_delta": cycle_context.get(
                     "on_preempt_count_delta", cycle_context.get("preempted",
                                                                   0)),
@@ -564,6 +710,15 @@ class RecoveryObservability:
                                                         "waiting_len", 0)),
                 "T_on_ms": round(t_on_ms, 3),
                 "S_ms": round(s_ms, 3),
+                "B_ms": round(float(cycle_context.get("recovery_budget_ms",
+                                                      0.0)), 3),
+                "barT_swap": cycle_context.get("barT_swap_ms_per_block", 0.0),
+                "barT_rec": cycle_context.get("barT_rec_ms_per_token", 0.0),
+                "gain_swap": cycle_context.get("swap_gain_blocks_per_ms", 0.0),
+                "gain_rec": cycle_context.get("rec_gain_tokens_per_ms", 0.0),
+                "x_swap": cycle_context.get("x_swap", 0),
+                "x_rec": cycle_context.get("x_rec", 0),
+                "over_budget_drop": cycle_context.get("over_budget_drop", 0),
                 "swapin_blocks": cycle_context.get("swapin_blocks", 0),
                 "swapout_blocks": cycle_context.get("swapout_blocks", 0),
                 "recompute_tokens": cycle_context.get("recompute_tokens", 0),
