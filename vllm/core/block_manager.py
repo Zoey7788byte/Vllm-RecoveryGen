@@ -1,7 +1,7 @@
 """A block manager that manages token blocks."""
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from typing import Sequence as GenericSequence
 from typing import Tuple
 
@@ -435,18 +435,211 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         self._swap_prefetch_blocks_total = max(
             0, self._swap_prefetch_blocks_total - len(entry.indices))
 
+    def apply_mws_hard_pin(self,
+                           seq_group: SequenceGroup,
+                           prefix_tokens: int,
+                           recent_tokens: int,
+                           *,
+                           reason: str = "enter_recovery") -> int:
+        total_pinned = 0
+        p_tokens = max(0, int(prefix_tokens))
+        r_tokens = max(0, int(recent_tokens))
+        for seq in seq_group.seqs:
+            block_table = self.block_tables.get(seq.seq_id)
+            num_blocks = len(
+                block_table.blocks) if block_table is not None else seq.n_blocks
+            try:
+                seq.ensure_recovery_blocks()
+                seq.recovery_state.align_to_num_blocks(num_blocks)
+            except Exception:
+                continue
+            block_size = max(1, int(seq.block_size))
+            p_blocks = ((p_tokens + block_size - 1) // block_size
+                        if p_tokens > 0 else 0)
+            r_blocks = ((r_tokens + block_size - 1) // block_size
+                        if r_tokens > 0 else 0)
+            pinned = seq.recovery_state.get_visible_indices_mws(
+                p_blocks, r_blocks)
+            seq.recovery_state.set_pinned_blocks(pinned)
+            total_pinned += len(pinned)
+            try:
+                log_recovery_event(
+                    "MWS_PIN_APPLIED",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    reason=reason,
+                    detail={
+                        "pinned_blocks": len(pinned),
+                        "mws_prefix_blocks": p_blocks,
+                        "mws_recent_blocks": r_blocks,
+                        "num_blocks": num_blocks,
+                        "pinned_sample": pinned[:16],
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+        return total_pinned
+
+    def get_null_block_id(self) -> Optional[int]:
+        try:
+            null_block = self.block_allocator.allocate_or_get_null_block()
+            return int(null_block.block_id)
+        except Exception:
+            return None
+
+    def clear_mws_hard_pin(self,
+                           seq_group: SequenceGroup,
+                           *,
+                           reason: str = "leave_recovery") -> int:
+        total_cleared = 0
+        for seq in seq_group.seqs:
+            pinned = seq.recovery_state.get_pinned_blocks_sorted()
+            if not pinned:
+                continue
+            total_cleared += len(pinned)
+            seq.recovery_state.clear_pinned_blocks()
+            try:
+                log_recovery_event(
+                    "MWS_PIN_RELEASED",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    reason=reason,
+                    detail={
+                        "cleared_blocks": len(pinned),
+                        "cleared_sample": pinned[:16],
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+        return total_cleared
+
+    def relax_mws_pin_for_swap(self,
+                               seq_group: SequenceGroup,
+                               *,
+                               min_unpinned: int = 1,
+                               reason: str = "swap_pressure") -> int:
+        target_unpinned = max(1, int(min_unpinned))
+        total_relaxed = 0
+        for seq in seq_group.seqs:
+            block_table = self.block_tables.get(seq.seq_id)
+            num_blocks = len(
+                block_table.blocks) if block_table is not None else seq.n_blocks
+            if num_blocks <= 1:
+                continue
+            try:
+                seq.ensure_recovery_blocks()
+                seq.recovery_state.align_to_num_blocks(num_blocks)
+            except Exception:
+                continue
+            pinned = seq.recovery_state.get_pinned_blocks_sorted()
+            if not pinned:
+                continue
+            pinned_set = set(int(idx) for idx in pinned)
+            need_relax = max(0, target_unpinned - (num_blocks - len(pinned_set)))
+            if need_relax <= 0:
+                continue
+
+            block_size = max(1, int(seq.block_size))
+            p_tokens = max(0, int(envs.REC_MWS_PREFIX_TOKENS))
+            r_tokens = max(0, int(envs.REC_MWS_RECENT_TOKENS))
+            p_blocks = ((p_tokens + block_size - 1) // block_size
+                        if p_tokens > 0 else 0)
+            r_blocks = ((r_tokens + block_size - 1) // block_size
+                        if r_tokens > 0 else 0)
+            mid_start = min(num_blocks, p_blocks)
+            mid_end = max(mid_start, num_blocks - r_blocks)
+
+            relaxed_indices: List[int] = []
+            for idx in pinned:
+                if need_relax <= 0:
+                    break
+                if idx < mid_start or idx >= mid_end:
+                    continue
+                if idx not in pinned_set:
+                    continue
+                pinned_set.remove(idx)
+                relaxed_indices.append(int(idx))
+                need_relax -= 1
+
+            if need_relax > 0:
+                center = num_blocks // 2
+                fallback = sorted(pinned_set, key=lambda x: abs(int(x) - center))
+                for idx in fallback:
+                    if need_relax <= 0:
+                        break
+                    pinned_set.remove(idx)
+                    relaxed_indices.append(int(idx))
+                    need_relax -= 1
+
+            if not relaxed_indices:
+                continue
+
+            seq.recovery_state.set_pinned_blocks(sorted(pinned_set))
+            total_relaxed += len(relaxed_indices)
+            try:
+                log_recovery_event(
+                    "MWS_PIN_RELAXED",
+                    req_id=seq_group.request_id,
+                    seq_id=seq.seq_id,
+                    reason=reason,
+                    detail={
+                        "num_blocks": num_blocks,
+                        "pinned_before": len(pinned),
+                        "pinned_after": len(pinned_set),
+                        "relaxed_blocks": len(relaxed_indices),
+                        "relaxed_sample": relaxed_indices[:16],
+                    },
+                    block_manager=self,
+                )
+            except Exception:
+                pass
+        return total_relaxed
+
     def _collect_swap_candidate_indices(
             self, seq: Sequence, blocks: List[Block],
             max_to_swap: int) -> Tuple[List[int], int]:
         if max_to_swap <= 0:
             return [], 0
         indices: List[int] = []
+        seen_indices = set()
         skipped_already_restored = 0
         try:
             start = max(0, seq.recovery_state.swap_frontier)
+            if int(envs.VLLM_RECOVERY_PHASE) >= 3 and (
+                    seq.recovery_state.mode in
+                (RecoveryMode.RECOVERY, RecoveryMode.FALLBACK)):
+                block_size = max(1, int(seq.block_size))
+                p_tokens = max(0, int(envs.REC_MWS_PREFIX_TOKENS))
+                r_tokens = max(0, int(envs.REC_MWS_RECENT_TOKENS))
+                p_blocks = ((p_tokens + block_size - 1) // block_size
+                            if p_tokens > 0 else 0)
+                r_blocks = ((r_tokens + block_size - 1) // block_size
+                            if r_tokens > 0 else 0)
+                preferred = seq.recovery_state.get_visible_indices_mws(
+                    p_blocks, r_blocks)
+                for idx in preferred:
+                    if idx < start or idx >= len(blocks):
+                        continue
+                    if len(indices) >= max_to_swap:
+                        break
+                    if idx in seen_indices:
+                        continue
+                    if seq.recovery_state.storage_hint.get(
+                            idx) != RecoveryStorageHint.HOST_STORED:
+                        continue
+                    if (idx < len(seq.recovery_state.restored_map)
+                            and seq.recovery_state.restored_map[idx]):
+                        skipped_already_restored += 1
+                        continue
+                    indices.append(idx)
+                    seen_indices.add(idx)
             for idx in range(start, len(blocks)):
                 if len(indices) >= max_to_swap:
                     break
+                if idx in seen_indices:
+                    continue
                 if seq.recovery_state.storage_hint.get(
                         idx) == RecoveryStorageHint.HOST_STORED:
                     if (idx < len(seq.recovery_state.restored_map)
@@ -454,10 +647,13 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                         skipped_already_restored += 1
                         continue
                     indices.append(idx)
+                    seen_indices.add(idx)
             if not indices and seq.recovery_state.storage_hint:
                 for idx in range(0, len(blocks)):
                     if len(indices) >= max_to_swap:
                         break
+                    if idx in seen_indices:
+                        continue
                     if seq.recovery_state.storage_hint.get(
                             idx) == RecoveryStorageHint.HOST_STORED:
                         if (idx < len(seq.recovery_state.restored_map)
@@ -465,6 +661,7 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                             skipped_already_restored += 1
                             continue
                         indices.append(idx)
+                        seen_indices.add(idx)
         except Exception:
             indices = list(range(0, min(len(blocks), max_to_swap)))
         return indices, skipped_already_restored
@@ -716,7 +913,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 # advance frontier/restored_map so interrupted work is resumable.
                 seq.ensure_recovery_blocks()
                 seq.recovery_state.recovery_enabled = True
-                seq.recovery_state.mode = RecoveryMode.RECOVERY
+                seq.recovery_state.set_mode(
+                    RecoveryMode.RECOVERY,
+                    reason="swap_in_progress",
+                    force=True,
+                )
                 seq.recovery_state.align_to_num_blocks(len(blocks))
                 if swapped_indices:
                     commit_start, commit_end, new_frontier = (
@@ -825,9 +1026,36 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
         Returns:
             bool: Whether it's possible to swap out current sequence group.
         """
-        alloc_status = self._can_swap(seq_group, Device.CPU,
-                                      SequenceStatus.RUNNING)
-        return alloc_status == AllocStatus.OK
+        blocks_to_swap: List[Block] = []
+        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            block_table = self.block_tables.get(seq.seq_id)
+            if block_table is None:
+                continue
+            blocks = block_table.blocks
+            if len(blocks) == 0:
+                continue
+            try:
+                seq.recovery_state.align_to_num_blocks(len(blocks))
+            except Exception:
+                pass
+            for idx, blk in enumerate(blocks):
+                if seq.recovery_state.is_pinned(idx):
+                    continue
+                if (seq.recovery_state.storage_hint.get(idx) ==
+                        RecoveryStorageHint.HOST_STORED):
+                    continue
+                blocks_to_swap.append(blk)
+        if len(blocks_to_swap) == 0:
+            return False
+        num_blocks_touched = self.block_allocator.get_num_full_blocks_touched(
+            blocks_to_swap, device=Device.CPU)
+        if num_blocks_touched <= 0:
+            return False
+        if self.block_allocator.get_num_total_blocks(
+                Device.CPU) < num_blocks_touched:
+            return False
+        return (self.block_allocator.get_num_free_blocks(Device.CPU) -
+                num_blocks_touched) >= 0
 
     def swap_out(self, seq_group: SequenceGroup) -> List[Tuple[int, int]]:
         """Returns the block id mapping (from GPU to CPU) generated by
@@ -845,8 +1073,53 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             blocks = self.block_tables[seq.seq_id].blocks
             if len(blocks) == 0:
                 continue
+            try:
+                seq.recovery_state.align_to_num_blocks(len(blocks))
+            except Exception:
+                pass
+            swappable_indices = [
+                idx for idx in range(len(blocks))
+                if (not seq.recovery_state.is_pinned(idx))
+                and (seq.recovery_state.storage_hint.get(idx) !=
+                     RecoveryStorageHint.HOST_STORED)
+            ]
+            if len(swappable_indices) == 0:
+                try:
+                    log_recovery_event(
+                        "SWAP_OUT_PINNED_SKIPPED",
+                        req_id=seq_group.request_id,
+                        seq_id=seq.seq_id,
+                        reason="all_blocks_pinned",
+                        detail={
+                            "pinned_blocks": len(
+                                seq.recovery_state.get_pinned_blocks_sorted()),
+                        },
+                        block_manager=self,
+                    )
+                except Exception:
+                    pass
+                try:
+                    log_recovery_event(
+                        "SWAP_OUT",
+                        req_id=seq_group.request_id,
+                        seq_id=seq.seq_id,
+                        reason="all_blocks_pinned",
+                        detail={
+                            "blocks_count": 0,
+                            "bytes": None,
+                            "swapped_indices_sample": [],
+                            "pinned_indices_sample": seq.recovery_state.
+                            get_pinned_blocks_sorted()[:16],
+                        },
+                        block_manager=self,
+                    )
+                except Exception:
+                    pass
+                continue
+            blocks_to_swap = [blocks[idx] for idx in swappable_indices]
+            requested_gpu_block_ids = [blk.block_id for blk in blocks_to_swap]
 
-            seq_swap_mapping = self.block_allocator.swap(blocks=blocks,
+            seq_swap_mapping = self.block_allocator.swap(blocks=blocks_to_swap,
                                                          src_device=Device.GPU,
                                                          dst_device=Device.CPU)
 
@@ -863,6 +1136,11 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
 
             physical_block_id_mapping.extend(
                 list(seq_physical_block_id_mapping.items()))
+            swapped_indices = [
+                idx for idx, gpu_block_id in zip(swappable_indices,
+                                                 requested_gpu_block_ids)
+                if gpu_block_id in seq_swap_mapping
+            ]
             try:
                 seq.recovery_obs.swapout_blocks_total += len(seq_swap_mapping)
             except Exception:
@@ -870,10 +1148,22 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             try:
                 seq.ensure_recovery_blocks()
                 seq.recovery_state.recovery_enabled = True
-                seq.recovery_state.mode = RecoveryMode.RECOVERY
+                seq.recovery_state.set_mode(
+                    RecoveryMode.RECOVERY,
+                    reason="swap_out_triggered",
+                    force=True,
+                )
                 seq.recovery_state.align_to_num_blocks(len(blocks))
-                seq.recovery_state.mark_all(RecoveryStorageHint.HOST_STORED)
-                seq.recovery_state.reset_restored_map(len(blocks))
+                for idx in swapped_indices:
+                    seq.recovery_state.storage_hint[
+                        idx] = RecoveryStorageHint.HOST_STORED
+                    if idx < len(seq.recovery_state.restored_map):
+                        seq.recovery_state.restored_map[idx] = False
+                for idx in seq.recovery_state.get_pinned_blocks_sorted():
+                    seq.recovery_state.storage_hint[
+                        idx] = RecoveryStorageHint.GPU_RESIDENT
+                    if idx < len(seq.recovery_state.restored_map):
+                        seq.recovery_state.restored_map[idx] = True
                 first_host = seq.recovery_state.first_host_block()
                 seq.recovery_state.swap_frontier = (first_host
                                                     if first_host is not None
@@ -904,6 +1194,9 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                     detail={
                         "blocks_count": len(seq_swap_mapping),
                         "bytes": None,
+                        "swapped_indices_sample": swapped_indices[:16],
+                        "pinned_indices_sample": seq.recovery_state.
+                        get_pinned_blocks_sorted()[:16],
                     },
                     block_manager=self,
                 )

@@ -400,6 +400,9 @@ class RecoveryStorageHint(enum.Enum):
 class RecoveryState:
     recovery_enabled: bool = False
     mode: RecoveryMode = RecoveryMode.NORMAL
+    mode_enter_ts_ns: int = 0
+    mode_switches: int = 0
+    mode_reason: str = "init"
     storage_hint: Dict[int, RecoveryStorageHint] = field(default_factory=dict)
     swap_frontier: int = 0
     rec_frontier: int = 0
@@ -409,6 +412,37 @@ class RecoveryState:
     swapin_blocks_total: int = 0
     swapout_blocks_total: int = 0
     recompute_tokens_total: int = 0
+    pinned_blocks: Set[int] = field(default_factory=set)
+
+    def ensure_mode_initialized(self, now_ns: Optional[int] = None) -> None:
+        if self.mode_enter_ts_ns > 0:
+            return
+        self.mode_enter_ts_ns = int(now_ns if now_ns is not None else
+                                    time.time_ns())
+
+    def mode_name(self) -> str:
+        return str(self.mode.value).strip().lower()
+
+    def set_mode(self,
+                 mode: RecoveryMode,
+                 *,
+                 reason: str,
+                 now_ns: Optional[int] = None,
+                 stable_window_ms: float = 0.0,
+                 force: bool = False) -> bool:
+        self.ensure_mode_initialized(now_ns)
+        ts_ns = int(now_ns if now_ns is not None else time.time_ns())
+        if mode == self.mode:
+            self.mode_reason = reason
+            return False
+        dwell_ms = max(0.0, (ts_ns - self.mode_enter_ts_ns) / 1e6)
+        if (not force) and stable_window_ms > 0.0 and dwell_ms < stable_window_ms:
+            return False
+        self.mode = mode
+        self.mode_enter_ts_ns = ts_ns
+        self.mode_switches += 1
+        self.mode_reason = reason
+        return True
 
     def ensure_blocks(self, num_blocks: int) -> None:
         if num_blocks <= 0:
@@ -419,6 +453,11 @@ class RecoveryState:
         for i in range(num_blocks):
             if i not in self.storage_hint:
                 self.storage_hint[i] = RecoveryStorageHint.GPU_RESIDENT
+        if self.pinned_blocks:
+            self.pinned_blocks = {
+                idx
+                for idx in self.pinned_blocks if 0 <= idx < num_blocks
+            }
 
     def align_to_num_blocks(self, num_blocks: int) -> None:
         # Keep recovery ledger strictly aligned with the physical block table.
@@ -428,6 +467,7 @@ class RecoveryState:
             self.storage_hint.clear()
             self.restored_map = []
             self.swap_frontier = 0
+            self.pinned_blocks.clear()
             return
         if len(self.restored_map) < num_blocks:
             self.restored_map.extend([False] * (num_blocks - len(
@@ -444,6 +484,11 @@ class RecoveryState:
             if i not in self.storage_hint:
                 self.storage_hint[i] = RecoveryStorageHint.GPU_RESIDENT
         self.swap_frontier = min(max(0, self.swap_frontier), num_blocks)
+        if self.pinned_blocks:
+            self.pinned_blocks = {
+                idx
+                for idx in self.pinned_blocks if 0 <= idx < num_blocks
+            }
 
     def num_blocks(self) -> int:
         if self.restored_map:
@@ -603,6 +648,84 @@ class RecoveryState:
         for hint in self.storage_hint.values():
             if hint == RecoveryStorageHint.HOST_STORED:
                 return True
+        return False
+
+    def _visible_indices_mws(self, prefix_blocks: int,
+                             recent_blocks: int) -> List[int]:
+        n = self.num_blocks()
+        if n <= 0:
+            return []
+        p = max(0, int(prefix_blocks))
+        r = max(0, int(recent_blocks))
+        if p + r >= n:
+            return list(range(n))
+        vis: List[int] = []
+        if p > 0:
+            vis.extend(range(0, min(n, p)))
+        if r > 0:
+            start = max(0, n - r)
+            vis.extend(range(start, n))
+        if not vis:
+            return []
+        return sorted(set(vis))
+
+    def get_visible_indices_mws(self, prefix_blocks: int,
+                                recent_blocks: int) -> List[int]:
+        return self._visible_indices_mws(prefix_blocks, recent_blocks)
+
+    def count_hints_in_indices(self, indices: List[int]) -> Tuple[int, int, int]:
+        n_gpu = 0
+        n_host = 0
+        n_missing = 0
+        for idx in indices:
+            hint = self.storage_hint.get(idx)
+            if hint == RecoveryStorageHint.GPU_RESIDENT:
+                n_gpu += 1
+            elif hint == RecoveryStorageHint.HOST_STORED:
+                n_host += 1
+            elif hint == RecoveryStorageHint.MISSING_RECOMPUTE:
+                n_missing += 1
+        return n_gpu, n_host, n_missing
+
+    def count_mws_hints(self, prefix_blocks: int,
+                        recent_blocks: int) -> Tuple[int, int, int]:
+        return self.count_hints_in_indices(
+            self._visible_indices_mws(prefix_blocks, recent_blocks))
+
+    def set_pinned_blocks(self, indices: List[int]) -> None:
+        n = self.num_blocks()
+        if n <= 0:
+            self.pinned_blocks.clear()
+            return
+        self.pinned_blocks = {
+            idx
+            for idx in indices if 0 <= int(idx) < n
+        }
+
+    def clear_pinned_blocks(self) -> None:
+        self.pinned_blocks.clear()
+
+    def is_pinned(self, idx: int) -> bool:
+        return int(idx) in self.pinned_blocks
+
+    def get_pinned_blocks_sorted(self) -> List[int]:
+        if not self.pinned_blocks:
+            return []
+        return sorted(self.pinned_blocks)
+
+    def needs_recovery_mws(self, prefix_blocks: int, recent_blocks: int) -> bool:
+        visible = self._visible_indices_mws(prefix_blocks, recent_blocks)
+        if not visible:
+            return False
+        for idx in visible:
+            hint = self.storage_hint.get(idx, RecoveryStorageHint.GPU_RESIDENT)
+            if hint == RecoveryStorageHint.HOST_STORED:
+                return True
+            if hint == RecoveryStorageHint.MISSING_RECOMPUTE:
+                if idx < len(self.restored_map) and not self.restored_map[idx]:
+                    return True
+                if idx >= len(self.restored_map):
+                    return True
         return False
 
     def recompute_step(self, delta_tokens: int, block_size: int,
@@ -810,7 +933,11 @@ class Sequence:
         self.data.reset_state_for_recompute()
         try:
             self.recovery_state.recovery_enabled = True
-            self.recovery_state.mode = RecoveryMode.RECOVERY
+            self.recovery_state.set_mode(
+                RecoveryMode.RECOVERY,
+                reason="reset_state_for_recompute",
+                force=True,
+            )
             self.recovery_state.ensure_blocks(self.n_blocks)
             self.recovery_state.reset_restored_map(self.n_blocks)
             self.recovery_state.mark_all(RecoveryStorageHint.MISSING_RECOMPUTE)

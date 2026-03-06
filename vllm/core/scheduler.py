@@ -1,4 +1,5 @@
 import enum
+import math
 import os
 import random
 import time
@@ -16,10 +17,12 @@ from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.recovery.budget_controller import BudgetController, BudgetSignals
 from vllm.recovery.cost_model import (get_cost_model_snapshot,
                                       observe_recompute_task)
+from vllm.recovery.mode_controller import ModeSignals, RecoveryModeController
 from vllm.recovery.observability import (RecoveryObservability, add_over_budget_drop,
                                          add_recompute, get_recovery_config,
                                          log_recovery_event)
-from vllm.sequence import (RecoveryMode, Sequence, SequenceData, SequenceGroup,
+from vllm.sequence import (RecoveryMode, RecoveryStorageHint, Sequence,
+                           SequenceData, SequenceGroup,
                            SequenceGroupMetadata, SequenceGroupMetadataDelta,
                            SequenceStatus)
 from vllm.utils import Device, PyObjectCache
@@ -424,6 +427,29 @@ class Scheduler:
         self._recovery_online_only_pass: bool = False
         self._recovery_budget_controller = BudgetController(self._recovery_cfg)
         self._recovery_last_budget_target_ms: float = 0.0
+        self._recovery_mode_controller = RecoveryModeController(self._recovery_cfg)
+        self._recovery_mode: str = "normal"
+        self._recovery_cycle_idx: int = 0
+        self._recovery_pause_decode_active: bool = False
+        self._recovery_admission_throttle_cycle: int = 0
+        self._recovery_mws_pinned_blocks_total: int = 0
+        self._recovery_mws_limit_blocks: int = 0
+        # Per-request anti-starvation state for tail recovery tasks.
+        self._recovery_req_no_progress_cycles: Dict[str, int] = {}
+        # Use persistent waiting pressure instead of single-cycle spikes.
+        self._recovery_waiting_streak: int = 0
+        self._recovery_waiting_streak_required: int = 2
+        self._recovery_waiting_pressure_headroom_margin: int = 8
+        self._recovery_force_progress_cycles: int = max(
+            2,
+            int(float(self._recovery_cfg.stall_ms) / max(
+                1.0, float(self._recovery_cfg.target_cycle_ms))),
+        )
+        self._recovery_force_max_tasks_per_cycle: int = 1
+        # Keep forced recompute chunks small enough to fit tight fallback
+        # budgets (e.g., 1.0~1.5ms) and guarantee progress.
+        self._recovery_force_recompute_tokens: int = 16
+        self._recovery_prev_preempt_delta: int = 0
 
         # Used to cache python objects
         self._seq_group_metadata_cache: List[PyObjectCache] = []
@@ -643,8 +669,21 @@ class Scheduler:
                 # Determine victim sequence
                 cont_loop = True
                 if running_queue:
-                    # Preempt the lowest-priority sequence group.
-                    victim_seq_group = running_queue.pop()
+                    victim_seq_group: Optional[SequenceGroup] = None
+                    # Under phase3 swap preemption, prefer victims that can
+                    # actually swap out with MWS pin constraints; otherwise a
+                    # single unlucky victim can turn preempt into recompute-only
+                    # and collapse swap/visibility signals.
+                    if (self._recovery_cfg.phase >= 3
+                            and self.user_specified_preemption_mode == "swap"):
+                        for cand in reversed(running_queue):
+                            if self._can_swap_out_with_phase3_pin(cand):
+                                victim_seq_group = cand
+                                running_queue.remove(cand)
+                                break
+                    if victim_seq_group is None:
+                        # Preempt the lowest-priority sequence group.
+                        victim_seq_group = running_queue.pop()
                 else:
                     # No other sequence group can be preempted.
                     # Preempt the current sequence group.
@@ -762,19 +801,22 @@ class Scheduler:
                     needs_recovery = True
                     break
             if needs_recovery and k_budget_remaining <= 0:
-                if self._recovery_online_only_pass:
-                    try:
-                        prefetch_fn = getattr(self.block_manager,
-                                              "prefetch_swap_in", None)
-                        if callable(prefetch_fn):
-                            prefetch_fn(seq_group, k_prefetch_max=4)
-                    except Exception:
-                        pass
-                swapped_queue.popleft()
-                leftover_swapped.appendleft(seq_group)
-                if not self._recovery_online_only_pass:
-                    add_over_budget_drop(1)
-                continue
+                if self._can_run_with_visibility_contract(seq_group):
+                    needs_recovery = False
+                else:
+                    if self._recovery_online_only_pass:
+                        try:
+                            prefetch_fn = getattr(self.block_manager,
+                                                  "prefetch_swap_in", None)
+                            if callable(prefetch_fn):
+                                prefetch_fn(seq_group, k_prefetch_max=4)
+                        except Exception:
+                            pass
+                    swapped_queue.popleft()
+                    leftover_swapped.appendleft(seq_group)
+                    if not self._recovery_online_only_pass:
+                        add_over_budget_drop(1)
+                    continue
 
             # If the sequence group cannot be swapped in, stop.
             is_prefill = seq_group.is_prefill()
@@ -814,11 +856,28 @@ class Scheduler:
                                                     if needs_recovery else 0))
             k_budget_remaining = max(0, k_budget_remaining - max(0, k_done))
             if not fully_restored:
-                if k_done == 0:
-                    break
-                swapped_queue.popleft()
-                leftover_swapped.appendleft(seq_group)
-                continue
+                if self._can_run_with_visibility_contract(seq_group):
+                    try:
+                        seq0 = seq_group.seqs[0] if seq_group.seqs else None
+                        log_recovery_event(
+                            "VISIBILITY_CONTRACT_ADMIT",
+                            req_id=seq_group.request_id,
+                            seq_id=(seq0.seq_id if seq0 is not None else None),
+                            reason="mws_ready_partial_restore",
+                            detail={
+                                "k_done": k_done,
+                                "k_budget_remaining": k_budget_remaining,
+                            },
+                            block_manager=self.block_manager,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    if k_done == 0:
+                        break
+                    swapped_queue.popleft()
+                    leftover_swapped.appendleft(seq_group)
+                    continue
 
             # The total number of sequences in the RUNNING state should not
             # exceed the maximum number of sequences.
@@ -1107,6 +1166,27 @@ class Scheduler:
         leftover_waiting_sequences: Deque[SequenceGroup] = deque()
         while self._passed_delay(time.time()) and waiting_queue:
             seq_group = waiting_queue[0]
+            throttle_mws, throttle_detail = self._should_throttle_mws_admission(
+                seq_group)
+            if throttle_mws:
+                self._recovery_admission_throttle_cycle += 1
+                self._recovery_mws_pinned_blocks_total = int(
+                    throttle_detail.get("mws_pinned_blocks_total", 0))
+                self._recovery_mws_limit_blocks = int(
+                    throttle_detail.get("mws_limit_blocks", 0))
+                try:
+                    seq0 = seq_group.seqs[0] if seq_group.seqs else None
+                    log_recovery_event(
+                        "ADMISSION_THROTTLE_MWS",
+                        req_id=seq_group.request_id,
+                        seq_id=(seq0.seq_id if seq0 is not None else None),
+                        reason="mws_capacity_guard",
+                        detail=throttle_detail,
+                        block_manager=self.block_manager,
+                    )
+                except Exception:
+                    pass
+                break
 
             waiting_seqs = seq_group.get_seqs(status=SequenceStatus.WAITING)
             assert len(waiting_seqs) == 1, (
@@ -1483,8 +1563,16 @@ class Scheduler:
         # such as self.running, self.swapped, and self.waiting.
         cycle_start_wall = time.time()
         self._recovery_obs.on_cycle_begin(cycle_start_wall)
+        self._recovery_cycle_idx += 1
+        self._recovery_admission_throttle_cycle = 0
+        self._recovery_mws_pinned_blocks_total = self._current_mws_pinned_blocks_total()
+        self._recovery_mws_limit_blocks = self._mws_capacity_limit_blocks()
         online_first_phase2 = self._is_phase2_online_first_enabled()
         self._recovery_online_only_pass = online_first_phase2
+        # Keep fallback decode throttling local to admission decisions.
+        # A full-cycle global pause introduces burstiness and can distort
+        # mode-switch/preempt ratios under short pressure bursts.
+        self._recovery_pause_decode_active = False
         scheduler_start_time = time.perf_counter()
 
         scheduler_outputs: SchedulerOutputs = self._schedule()
@@ -1497,6 +1585,10 @@ class Scheduler:
 
         # Create input data structures.
         seq_group_metadata_list: List[SequenceGroupMetadata] = []
+        visibility_enforced_cnt = 0
+        visible_tokens_sum = 0
+        visible_recent_tokens_sum = 0
+        visibility_counted_seq_ids: Set[int] = set()
         for i, scheduled_seq_group in enumerate(
                 scheduler_outputs.scheduled_seq_groups):
             seq_group = scheduled_seq_group.seq_group
@@ -1529,7 +1621,37 @@ class Scheduler:
             for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
                 seq_id = seq.seq_id
                 seq_data[seq_id] = seq.data
-                block_tables[seq_id] = self.block_manager.get_block_table(seq)
+                raw_block_table = self.block_manager.get_block_table(seq)
+                masked_block_table, vis_detail = self._mask_block_table_for_visibility(
+                    seq, raw_block_table)
+                block_tables[seq_id] = masked_block_table
+                if int(vis_detail.get("enforced", 0)) == 1:
+                    visibility_counted_seq_ids.add(seq.seq_id)
+                    visibility_enforced_cnt += 1
+                    visible_tokens_sum += int(vis_detail.get("visible_tokens", 0))
+                    visible_recent_tokens_sum += int(vis_detail.get(
+                        "W_min_tokens", 0))
+                    try:
+                        log_recovery_event(
+                            "VISIBILITY_WINDOW_ENFORCED",
+                            req_id=seq_group.request_id,
+                            seq_id=seq.seq_id,
+                            reason="recovery_visibility_contract",
+                            detail={
+                                "A_tokens": int(vis_detail.get("A_tokens", 0)),
+                                "W_min_tokens": int(
+                                    vis_detail.get("W_min_tokens", 0)),
+                                "visible_tokens": int(
+                                    vis_detail.get("visible_tokens", 0)),
+                                "visible_blocks": int(
+                                    vis_detail.get("visible_blocks", 0)),
+                                "masked_blocks": int(
+                                    vis_detail.get("masked_blocks", 0)),
+                            },
+                            block_manager=self.block_manager,
+                        )
+                    except Exception:
+                        pass
                 self.block_manager.access_all_blocks_in_seq(seq, now)
 
             if self.cache_config.enable_prefix_caching:
@@ -1616,6 +1738,26 @@ class Scheduler:
                     self._execute_recompute_micro_task(seq_group, seq,
                                                        token_chunk_size)
 
+        if self._recovery_cfg.phase >= 3:
+            for seq_group in list(self.waiting) + list(self.running) + list(
+                    self.swapped):
+                for seq in seq_group.seqs:
+                    if seq.seq_id in visibility_counted_seq_ids:
+                        continue
+                    if (not seq.recovery_state.recovery_enabled
+                            or seq.recovery_state.mode == RecoveryMode.NORMAL):
+                        continue
+                    raw_block_table = self.block_manager.get_block_table(seq)
+                    if len(raw_block_table) == 0:
+                        continue
+                    _, vis_summary = self._visibility_contract_summary(
+                        seq, len(raw_block_table))
+                    visibility_enforced_cnt += 1
+                    visible_tokens_sum += int(vis_summary.get(
+                        "visible_tokens", 0))
+                    visible_recent_tokens_sum += int(vis_summary.get(
+                        "W_min_tokens", 0))
+
         # Now that the batch has been created, we can assume all blocks in the
         # batch will have been computed before the next scheduling invocation.
         # This is because the engine assumes that a failure in model execution
@@ -1649,44 +1791,173 @@ class Scheduler:
         slack_forced_zero = 0
         slack_escape_hatch = 0
         stalled = False
-        high_load = (len(self.waiting) > 0 or scheduler_outputs.preempted > 0)
+        mode_switched = 0
+        mode_reason = "phase2_default"
+        has_recovery_work = False
+        req_mode_normal = 0
+        req_mode_recovery = 0
+        req_mode_fallback = 0
+        req_mode_switches = 0
+        req_mode_residence_ms_avg = 0.0
+        mode_mem_safe = 1
+        mode_global_safe_ms = 0.0
+        mode_watermark_hi_blocks = 0
+        mode_allow_normal = 1
+        fresh_preempt_edge = 0
+        fallback_budget_allowed = False
+        fallback_budget_reason = "not_fallback"
+        fallback_floor_ms = 0.0
+        waiting_persistent = 0
+        waiting_headroom_tight = 0
+        hard_low_headroom = 0
+        hard_pressure = 0
+        high_load_pressure = 0
+        free_gpu_blocks = 0
+        total_gpu_blocks = getattr(self.block_manager, "num_total_gpu_blocks", 0)
+        mode_watermark_hi_blocks = int(
+            getattr(self.block_manager, "watermark_blocks", 0) or 0)
+        try:
+            free_gpu_blocks = self.block_manager.get_num_free_gpu_blocks()
+        except Exception:
+            free_gpu_blocks = 0
+        phase3_enabled = self._recovery_cfg.phase >= 3
+        waiting_len = len(self.waiting)
+        swapped_len = len(self.swapped)
+        waiting_relief_threshold = 2
+        hard_low_headroom = int(free_gpu_blocks <= mode_watermark_hi_blocks)
+        waiting_headroom_tight = int(
+            free_gpu_blocks <=
+            (mode_watermark_hi_blocks +
+             self._recovery_waiting_pressure_headroom_margin))
+        if waiting_len >= waiting_relief_threshold:
+            self._recovery_waiting_streak += 1
+        else:
+            self._recovery_waiting_streak = 0
+        waiting_persistent = int(
+            self._recovery_waiting_streak >= self._recovery_waiting_streak_required)
+        hard_pressure = int((scheduler_outputs.preempted > 0)
+                            or hard_low_headroom)
+        high_load_pressure = int(waiting_persistent and waiting_headroom_tight)
         if online_first_phase2:
-            stalled = self._has_stalled_recovery(time.time_ns())
-        # In high-load cycles (queue pressure or fresh preemptions), treat
-        # slack as unavailable to protect online path and suppress oscillation.
-        if online_first_phase2 and high_load:
+            now_ns = time.time_ns()
+            stalled = self._has_stalled_recovery(now_ns)
+            has_recovery_work = self._has_recovery_work()
+            if phase3_enabled:
+                mode_update = self._recovery_mode_controller.update(
+                    ModeSignals(
+                        has_recovery_work=has_recovery_work,
+                        waiting_len=waiting_len,
+                        preempt_delta=scheduler_outputs.preempted,
+                        stalled=stalled,
+                        free_kv_blocks=free_gpu_blocks,
+                        total_kv_blocks=total_gpu_blocks,
+                        watermark_hi_blocks=mode_watermark_hi_blocks,
+                        now_ns=now_ns,
+                    ))
+                self._recovery_mode = str(mode_update["mode"])
+                mode_reason = str(mode_update["reason"])
+                mode_switched = int(mode_update["switched"])
+                mode_mem_safe = int(mode_update.get("mem_safe", 1))
+                mode_global_safe_ms = float(mode_update.get("global_safe_ms", 0.0))
+                mode_watermark_hi_blocks = int(
+                    mode_update.get("watermark_hi_blocks", mode_watermark_hi_blocks))
+                mode_allow_normal = int(mode_update.get("allow_normal", 1))
+                req_mode_counts = self._update_request_modes_phase3(
+                    now_ns,
+                    global_mode=self._recovery_mode,
+                    global_reason=mode_reason,
+                    global_allow_normal=bool(mode_allow_normal),
+                )
+                req_mode_normal = int(req_mode_counts.get("normal", 0))
+                req_mode_recovery = int(req_mode_counts.get("recovery", 0))
+                req_mode_fallback = int(req_mode_counts.get("fallback", 0))
+                req_mode_switches = int(req_mode_counts.get("switches", 0))
+                req_mode_residence_ms_avg = float(
+                    req_mode_counts.get("residence_ms_avg", 0.0))
+            else:
+                self._recovery_mode = ("recovery"
+                                       if has_recovery_work else "normal")
+        # In high-load pressure cycles, treat slack as unavailable to protect
+        # online path, but keep a tiny continuous recovery slice to avoid
+        # recovery starvation and visibility-signal collapse.
+        if (online_first_phase2 and self._recovery_mode != "fallback"
+                and (hard_pressure or high_load_pressure)):
             s_ms = 0.0
             slack_forced_zero = 1
             # Escape hatch: when recovery is stalled, grant a tiny budget so
             # progress can continue and long swap-in gaps are capped.
-            if stalled:
-                s_ms = min(raw_s_ms, max(1e-3, self._recovery_cfg.budget_min_ms))
+            fresh_preempt_edge = int(
+                scheduler_outputs.preempted > 0
+                and self._recovery_prev_preempt_delta <= 0)
+            proactive_preempt = (
+                phase3_enabled
+                and has_recovery_work
+                and fresh_preempt_edge == 1
+            )
+            low_budget_progress = (
+                has_recovery_work
+                and swapped_len > 0
+                and raw_s_ms > 0.0
+                and hard_low_headroom == 0
+            )
+            if stalled or proactive_preempt or low_budget_progress:
+                s_ms = min(raw_s_ms,
+                           max(1e-3, float(self._recovery_cfg.budget_min_ms)))
                 if s_ms > 0.0:
                     slack_forced_zero = 0
                     slack_escape_hatch = 1
+        elif online_first_phase2 and self._recovery_mode == "fallback":
+            # Fallback uses soft suppression under sustained waiting pressure.
+            # Avoid full freezes that can collapse swap/visibility signals.
+            fallback_floor_base = (self._recovery_cfg.budget_min_ms +
+                                   self._recovery_cfg.fallback_budget_boost_ms)
+            fallback_floor_ms = fallback_floor_base
+            if (not stalled) and waiting_len > 0 and high_load_pressure:
+                fallback_budget_allowed = False
+                fallback_budget_reason = "fallback_online_pressure_hold"
+            elif stalled:
+                fallback_budget_allowed = True
+                fallback_budget_reason = "stalled_recovery"
+            elif waiting_len == 0:
+                fallback_budget_allowed = True
+                fallback_budget_reason = "fallback_no_waiting_pressure"
+            elif has_recovery_work:
+                fallback_budget_allowed = True
+                fallback_floor_ms = float(self._recovery_cfg.budget_min_ms)
+                fallback_budget_reason = "fallback_soft_pressure"
+            else:
+                fallback_budget_allowed = False
+                fallback_budget_reason = "fallback_no_recovery_work"
+            if fallback_budget_allowed:
+                s_ms = min(raw_s_ms, max(1e-3, fallback_floor_ms))
+                slack_escape_hatch = 1 if s_ms > 0.0 else 0
+            else:
+                s_ms = 0.0
+                slack_forced_zero = 1
         else:
             s_ms = raw_s_ms
         recovery_overhead_ms = 0.0
         budget_target_ms = self._recovery_last_budget_target_ms
         budget_exec_ms = self._recovery_last_budget_ms
         if online_first_phase2:
-            free_gpu_blocks = 0
-            total_gpu_blocks = getattr(self.block_manager, "num_total_gpu_blocks", 0)
-            try:
-                free_gpu_blocks = self.block_manager.get_num_free_gpu_blocks()
-            except Exception:
-                free_gpu_blocks = 0
             decision = self._recovery_budget_controller.update(
                 BudgetSignals(
                     slack_ms=s_ms,
                     preempt_delta=scheduler_outputs.preempted,
                     free_kv_blocks=free_gpu_blocks,
                     total_kv_blocks=total_gpu_blocks,
-                    waiting_len=len(self.waiting),
+                    waiting_len=waiting_len,
                     stalled=stalled,
                 ))
             budget_target_ms = float(decision["B_target_ms"])
             budget_exec_ms = float(decision["B_ms"])
+            if self._recovery_mode == "fallback":
+                if fallback_budget_allowed:
+                    budget_target_ms = max(budget_target_ms, fallback_floor_ms)
+                    budget_exec_ms = min(max(0.0, s_ms), budget_target_ms)
+                else:
+                    budget_target_ms = 0.0
+                    budget_exec_ms = 0.0
             self._recovery_last_budget_target_ms = budget_target_ms
             self._recovery_last_budget_ms = budget_exec_ms
             try:
@@ -1700,6 +1971,35 @@ class Scheduler:
                         "T_cyc_ms": round(t_cyc_target_ms, 3),
                         "slack_forced_zero": slack_forced_zero,
                         "slack_escape_hatch": slack_escape_hatch,
+                        "recovery_mode": self._recovery_mode,
+                        "mode_switched": mode_switched,
+                        "mode_reason": mode_reason,
+                        "mode_mem_safe": mode_mem_safe,
+                        "mode_global_safe_ms": round(mode_global_safe_ms, 3),
+                        "mode_allow_normal": mode_allow_normal,
+                        "mode_watermark_hi_blocks": mode_watermark_hi_blocks,
+                        "req_mode_normal": req_mode_normal,
+                        "req_mode_recovery": req_mode_recovery,
+                        "req_mode_fallback": req_mode_fallback,
+                        "req_mode_switches": req_mode_switches,
+                        "req_mode_residence_ms_avg": round(
+                            req_mode_residence_ms_avg, 3),
+                        "mode_switch_delta": req_mode_switches,
+                        "fresh_preempt_edge": fresh_preempt_edge,
+                        "hard_pressure": hard_pressure,
+                        "high_load_pressure": high_load_pressure,
+                        "hard_low_headroom": hard_low_headroom,
+                        "waiting_headroom_tight": waiting_headroom_tight,
+                        "waiting_persistent": waiting_persistent,
+                        "waiting_streak": int(self._recovery_waiting_streak),
+                        "swapped_len": swapped_len,
+                        "fallback_budget_allowed": int(fallback_budget_allowed),
+                        "fallback_budget_reason": fallback_budget_reason,
+                        "admission_throttle": int(
+                            self._recovery_admission_throttle_cycle),
+                        "mws_pinned_blocks_total": int(
+                            self._recovery_mws_pinned_blocks_total),
+                        "mws_limit_blocks": int(self._recovery_mws_limit_blocks),
                     },
                     block_manager=self.block_manager,
                 )
@@ -1717,8 +2017,37 @@ class Scheduler:
                         "raw_S_ms": round(raw_s_ms, 3),
                         "slack_forced_zero": slack_forced_zero,
                         "slack_escape_hatch": slack_escape_hatch,
+                        "recovery_mode": self._recovery_mode,
+                        "mode_switched": mode_switched,
+                        "mode_reason": mode_reason,
+                        "mode_mem_safe": mode_mem_safe,
+                        "mode_global_safe_ms": round(mode_global_safe_ms, 3),
+                        "mode_allow_normal": mode_allow_normal,
+                        "mode_watermark_hi_blocks": mode_watermark_hi_blocks,
+                        "req_mode_normal": req_mode_normal,
+                        "req_mode_recovery": req_mode_recovery,
+                        "req_mode_fallback": req_mode_fallback,
+                        "req_mode_switches": req_mode_switches,
+                        "req_mode_residence_ms_avg": round(
+                            req_mode_residence_ms_avg, 3),
+                        "mode_switch_delta": req_mode_switches,
+                        "fresh_preempt_edge": fresh_preempt_edge,
+                        "hard_pressure": hard_pressure,
+                        "high_load_pressure": high_load_pressure,
+                        "hard_low_headroom": hard_low_headroom,
+                        "waiting_headroom_tight": waiting_headroom_tight,
+                        "waiting_persistent": waiting_persistent,
+                        "waiting_streak": int(self._recovery_waiting_streak),
+                        "swapped_len": swapped_len,
+                        "fallback_budget_allowed": int(fallback_budget_allowed),
+                        "fallback_budget_reason": fallback_budget_reason,
+                        "admission_throttle": int(
+                            self._recovery_admission_throttle_cycle),
+                        "mws_pinned_blocks_total": int(
+                            self._recovery_mws_pinned_blocks_total),
+                        "mws_limit_blocks": int(self._recovery_mws_limit_blocks),
                         "preempt_delta": scheduler_outputs.preempted,
-                        "waiting_len": len(self.waiting),
+                        "waiting_len": waiting_len,
                         "free_kv_blocks": free_gpu_blocks,
                         "total_kv_blocks": total_gpu_blocks,
                         "stalled": int(stalled),
@@ -1764,6 +2093,8 @@ class Scheduler:
             if swap_frontier_count > 0:
                 swap_frontier_avg = (swap_frontier_sum /
                                      swap_frontier_count)
+            mws_pinned_blocks_total = self._current_mws_pinned_blocks_total()
+            self._recovery_mws_pinned_blocks_total = mws_pinned_blocks_total
             cycle_ctx = {
                 "prefill_groups": num_prefill,
                 "decode_groups": num_decode,
@@ -1782,6 +2113,27 @@ class Scheduler:
                 "raw_S_ms": round(raw_s_ms, 3),
                 "slack_forced_zero": slack_forced_zero,
                 "slack_escape_hatch": slack_escape_hatch,
+                "recovery_mode": self._recovery_mode,
+                "mode_switched": mode_switched,
+                "mode_reason": mode_reason,
+                "mode_mem_safe": mode_mem_safe,
+                "mode_global_safe_ms": round(mode_global_safe_ms, 3),
+                "mode_allow_normal": mode_allow_normal,
+                "mode_watermark_hi_blocks": mode_watermark_hi_blocks,
+                "req_mode_normal": req_mode_normal,
+                "req_mode_recovery": req_mode_recovery,
+                "req_mode_fallback": req_mode_fallback,
+                "req_mode_switches": req_mode_switches,
+                "req_mode_residence_ms_avg": round(req_mode_residence_ms_avg,
+                                                   3),
+                "mode_switch_delta": req_mode_switches,
+                "pause_decode_active": int(self._recovery_pause_decode_active),
+                "admission_throttle": int(self._recovery_admission_throttle_cycle),
+                "mws_pinned_blocks_total": int(mws_pinned_blocks_total),
+                "mws_limit_blocks": int(self._recovery_mws_limit_blocks),
+                "visibility_enforced": int(visibility_enforced_cnt),
+                "visible_tokens": int(visible_tokens_sum),
+                "visible_recent_tokens": int(visible_recent_tokens_sum),
                 "recovery_overhead_ms": round(recovery_overhead_ms, 3),
                 "recovery_budget_target_ms": round(budget_target_ms, 3),
                 "recovery_budget_blocks": self._recovery_last_budget_blocks,
@@ -1820,6 +2172,8 @@ class Scheduler:
                 cycle_ctx.get("recovery_token_slack_est", 0))
         except Exception:
             pass
+
+        self._recovery_prev_preempt_delta = int(scheduler_outputs.preempted)
 
         # Recovery stalled detection (Phase1 diagnostic only).
         try:
@@ -1925,6 +2279,11 @@ class Scheduler:
     def _select_recovery_tasks(self, budget_ms: float) -> List[_RecoveryTask]:
         now_ns = time.time_ns()
         stall_threshold_ns = int(max(1.0, float(self._recovery_cfg.stall_ms)) * 1e6)
+        phase3_enabled = self._recovery_cfg.phase >= 3
+        waiting_pressure = len(self.waiting) > 0
+        recent_preempt_pressure = self._recovery_prev_preempt_delta > 0
+        defer_deep_restore = (phase3_enabled
+                              and (waiting_pressure or recent_preempt_pressure))
         snapshot = get_cost_model_snapshot()
         bar_t_swap = max(1e-6, float(snapshot.get("barT_swap_ms_per_block", 1.0)))
         bar_t_rec = max(1e-6, float(snapshot.get("barT_rec_ms_per_token", 0.05)))
@@ -1958,6 +2317,18 @@ class Scheduler:
                 stalled_boost = 2.0 if stalled else 1.0
                 preempt_penalty = 1.0 / (1.0 + 0.1 * max(0, preempt_cnt))
                 weight = stalled_boost * preempt_penalty
+                mws_need = False
+                mws_host = 0
+                if phase3_enabled:
+                    p_blocks, r_blocks = self._mws_blocks_for_seq(seq)
+                    _, mws_host, mws_missing = seq.recovery_state.count_mws_hints(
+                        p_blocks, r_blocks)
+                    mws_need = (mws_host > 0 or mws_missing > 0)
+                    if seq.recovery_state.mode == RecoveryMode.FALLBACK:
+                        # Fallback should prioritize fast contract readiness.
+                        weight *= 1.5
+                        if mws_need:
+                            weight *= 1.25
 
                 if (seq.status == SequenceStatus.SWAPPED
                         and seq.recovery_state.has_host_stored()):
@@ -1966,9 +2337,30 @@ class Scheduler:
                         _, remaining_host, _ = seq.recovery_state.count_hints()
                     except Exception:
                         remaining_host = 0
+                    host_target = remaining_host
+                    if (phase3_enabled
+                            and seq.recovery_state.mode == RecoveryMode.FALLBACK
+                            and mws_host > 0):
+                        host_target = mws_host
+                    if (phase3_enabled
+                            and seq.recovery_state.mode in
+                        (RecoveryMode.RECOVERY, RecoveryMode.FALLBACK)):
+                        if mws_host > 0:
+                            # Visibility contract debt is always first-class.
+                            host_target = mws_host
+                        elif defer_deep_restore:
+                            # Under online pressure, defer non-visible deep
+                            # restore to avoid inflating decode stalls.
+                            continue
+                        else:
+                            # Keep eventual convergence without aggressive
+                            # full-history restore bursts.
+                            host_target = min(remaining_host, 1)
+                    if host_target <= 0:
+                        continue
                     # Prefer finishing near-complete requests to reduce long
                     # recovery gaps on tail blocks.
-                    finish_boost = 1.0 + (1.0 / max(1.0, float(remaining_host)))
+                    finish_boost = 1.0 + (1.0 / max(1.0, float(host_target)))
                     new_task = _RecoveryTask(
                         kind="swap",
                         seq_group=seq_group,
@@ -1977,7 +2369,7 @@ class Scheduler:
                         gain_density=gain_swap,
                         priority=weight * gain_swap * finish_boost,
                         delta_tokens=0,
-                        remaining_host_blocks=max(0, remaining_host),
+                        remaining_host_blocks=max(0, host_target),
                         stalled=stalled,
                     )
                     if gid not in swap_group_task_idx:
@@ -1996,7 +2388,24 @@ class Scheduler:
 
                 if (seq.recovery_state.has_missing_recompute()
                         and (not seq.recovery_state.has_host_stored())):
-                    est_cost_ms = max(1e-6, bar_t_rec * float(delta_tokens))
+                    req_delta_tokens = delta_tokens
+                    # Keep recompute tasks executable under tight budgets by
+                    # adapting chunk size to remaining cycle slack.
+                    budget_cap_tokens = max(
+                        1,
+                        int(
+                            math.floor(
+                                max(1e-6, float(budget_ms)) / bar_t_rec)),
+                    )
+                    req_delta_tokens = min(req_delta_tokens, budget_cap_tokens)
+                    if (phase3_enabled
+                            and seq.recovery_state.mode == RecoveryMode.FALLBACK
+                            and mws_need):
+                        # Fallback focuses on visible contract readiness first.
+                        fallback_tokens = max(1, delta_tokens // 2)
+                        req_delta_tokens = min(req_delta_tokens,
+                                               fallback_tokens)
+                    est_cost_ms = max(1e-6, bar_t_rec * float(req_delta_tokens))
                     tasks.append(
                         _RecoveryTask(
                             kind="recompute",
@@ -2005,7 +2414,7 @@ class Scheduler:
                             est_cost_ms=est_cost_ms,
                             gain_density=gain_rec,
                             priority=weight * gain_rec,
-                            delta_tokens=delta_tokens,
+                            delta_tokens=req_delta_tokens,
                             stalled=stalled,
                         ))
 
@@ -2035,15 +2444,649 @@ class Scheduler:
                     return True
         return False
 
+    def _iter_all_sequence_groups(self) -> Iterable[SequenceGroup]:
+        seen: Set[int] = set()
+        for seq_group in list(self.waiting) + list(self.running) + list(
+                self.swapped):
+            gid = id(seq_group)
+            if gid in seen:
+                continue
+            seen.add(gid)
+            yield seq_group
+
+    def _mws_blocks_for_seq(self, seq: Sequence) -> Tuple[int, int]:
+        block_size = max(1, int(seq.block_size))
+        prefix_tokens = max(0, int(self._recovery_cfg.mws_prefix_tokens))
+        recent_tokens = max(0, int(self._recovery_cfg.mws_recent_tokens))
+        prefix_blocks = ((prefix_tokens + block_size - 1) // block_size
+                         if prefix_tokens > 0 else 0)
+        recent_blocks = ((recent_tokens + block_size - 1) // block_size
+                         if recent_tokens > 0 else 0)
+        return prefix_blocks, recent_blocks
+
+    def _can_swap_out_with_phase3_pin(self, seq_group: SequenceGroup) -> bool:
+        block_tables = getattr(self.block_manager, "block_tables", None)
+        if block_tables is None:
+            return True
+        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            table = block_tables.get(seq.seq_id)
+            if table is None:
+                continue
+            blocks = table.blocks
+            if len(blocks) <= 0:
+                continue
+            try:
+                seq.recovery_state.align_to_num_blocks(len(blocks))
+            except Exception:
+                pass
+            p_blocks, r_blocks = self._mws_blocks_for_seq(seq)
+            pinned = set(
+                seq.recovery_state.get_visible_indices_mws(p_blocks, r_blocks))
+            for idx in range(len(blocks)):
+                if idx in pinned:
+                    continue
+                if (seq.recovery_state.storage_hint.get(idx) ==
+                        RecoveryStorageHint.HOST_STORED):
+                    continue
+                return True
+        return False
+
+    def _visibility_contract_summary(
+        self,
+        seq: Sequence,
+        num_blocks: int,
+    ) -> Tuple[Set[int], Dict[str, int]]:
+        total_blocks = max(0, int(num_blocks))
+        try:
+            seq.recovery_state.align_to_num_blocks(total_blocks)
+        except Exception:
+            pass
+        seq_len = int(max(0, seq.get_len()))
+        a_tokens = min(seq_len, max(0, int(self._recovery_cfg.mws_prefix_tokens)))
+        remaining_tokens = max(0, seq_len - a_tokens)
+        w_min_tokens = min(remaining_tokens,
+                           max(0, int(self._recovery_cfg.mws_recent_tokens)))
+        visible_tokens = min(seq_len, a_tokens + w_min_tokens)
+        prefix_blocks, recent_blocks = self._mws_blocks_for_seq(seq)
+        visible_indices = set(
+            seq.recovery_state.get_visible_indices_mws(prefix_blocks,
+                                                       recent_blocks))
+        visible_blocks = min(total_blocks, len(visible_indices))
+        return visible_indices, {
+            "A_tokens": int(a_tokens),
+            "W_min_tokens": int(w_min_tokens),
+            "visible_tokens": int(visible_tokens),
+            "visible_blocks": int(visible_blocks),
+            "masked_blocks": int(max(0, total_blocks - visible_blocks)),
+        }
+
+    def _mask_block_table_for_visibility(
+        self,
+        seq: Sequence,
+        block_table: List[int],
+    ) -> Tuple[List[int], Dict[str, Union[int, float]]]:
+        detail: Dict[str, Union[int, float]] = {
+            "enforced": 0,
+            "A_tokens": 0,
+            "W_min_tokens": 0,
+            "visible_tokens": int(seq.get_len()),
+            "visible_blocks": len(block_table),
+            "masked_blocks": 0,
+        }
+        if self._recovery_cfg.phase < 3:
+            return block_table, detail
+        if (not seq.recovery_state.recovery_enabled or
+                seq.recovery_state.mode == RecoveryMode.NORMAL):
+            return block_table, detail
+        if len(block_table) == 0:
+            return block_table, detail
+        null_id_fn = getattr(self.block_manager, "get_null_block_id", None)
+        if not callable(null_id_fn):
+            return block_table, detail
+        null_block_id = null_id_fn()
+        if null_block_id is None:
+            return block_table, detail
+
+        visible_indices, vis_summary = self._visibility_contract_summary(
+            seq, len(block_table))
+        if len(visible_indices) >= len(block_table):
+            # Contract is active and currently satisfied without masking.
+            detail.update({
+                "enforced": 1,
+                "A_tokens": int(vis_summary.get("A_tokens", 0)),
+                "W_min_tokens": int(vis_summary.get("W_min_tokens", 0)),
+                "visible_tokens": int(vis_summary.get("visible_tokens", 0)),
+                "visible_blocks": len(block_table),
+                "masked_blocks": 0,
+                "null_block_id": int(null_block_id),
+            })
+            return block_table, detail
+
+        masked = list(block_table)
+        masked_blocks = 0
+        for idx in range(len(masked)):
+            if idx in visible_indices:
+                continue
+            masked[idx] = int(null_block_id)
+            masked_blocks += 1
+
+        detail.update({
+            "enforced": 1 if masked_blocks > 0 else 0,
+            "A_tokens": int(vis_summary.get("A_tokens", 0)),
+            "W_min_tokens": int(vis_summary.get("W_min_tokens", 0)),
+            "visible_tokens": int(vis_summary.get("visible_tokens", 0)),
+            "visible_blocks": int(vis_summary.get("visible_blocks", 0)),
+            "masked_blocks": masked_blocks,
+            "null_block_id": int(null_block_id),
+        })
+        return masked, detail
+
+    def _can_run_with_visibility_contract(self, seq_group: SequenceGroup) -> bool:
+        if self._recovery_cfg.phase < 3:
+            return False
+        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+            if not seq.recovery_state.recovery_enabled:
+                return False
+            p_blocks, r_blocks = self._mws_blocks_for_seq(seq)
+            if seq.recovery_state.needs_recovery_mws(p_blocks, r_blocks):
+                return False
+        return True
+
+    def _estimate_mws_blocks_for_seq(self, seq: Sequence) -> int:
+        block_size = max(1, int(seq.block_size))
+        mws_tokens = (max(0, int(self._recovery_cfg.mws_prefix_tokens)) +
+                      max(0, int(self._recovery_cfg.mws_recent_tokens)))
+        if mws_tokens <= 0:
+            return 0
+        mws_blocks = (mws_tokens + block_size - 1) // block_size
+        return max(0, min(int(seq.n_blocks), int(mws_blocks)))
+
+    def _current_mws_pinned_blocks_total(self) -> int:
+        total = 0
+        seen_seq_ids: Set[int] = set()
+        for seq_group in self._iter_all_sequence_groups():
+            for seq in seq_group.seqs:
+                sid = int(seq.seq_id)
+                if sid in seen_seq_ids:
+                    continue
+                seen_seq_ids.add(sid)
+                pinned = len(seq.recovery_state.pinned_blocks)
+                if pinned > 0:
+                    total += pinned
+                    continue
+                if seq.recovery_state.recovery_enabled:
+                    total += self._estimate_mws_blocks_for_seq(seq)
+        return max(0, int(total))
+
+    def _mws_capacity_limit_blocks(self) -> int:
+        total_gpu_blocks = int(
+            max(0, getattr(self.block_manager, "num_total_gpu_blocks", 0)))
+        rho = float(self._recovery_cfg.mws_admit_rho)
+        rho = max(0.0, min(1.0, rho))
+        return max(0, int(rho * float(total_gpu_blocks)))
+
+    def _estimate_mws_blocks_for_group(self, seq_group: SequenceGroup) -> int:
+        total = 0
+        for seq in seq_group.seqs:
+            total += self._estimate_mws_blocks_for_seq(seq)
+        return max(0, int(total))
+
+    def _is_new_admission_candidate(self, seq_group: SequenceGroup) -> bool:
+        for seq in seq_group.get_seqs(status=SequenceStatus.WAITING):
+            if seq.recovery_state.recovery_enabled:
+                return False
+        return True
+
+    def _should_throttle_mws_admission(
+            self, seq_group: SequenceGroup) -> Tuple[bool, Dict[str, Union[int,
+                                                                            float]]]:
+        if self._recovery_cfg.phase < 3:
+            return False, {}
+        if not self._is_new_admission_candidate(seq_group):
+            return False, {}
+        limit_blocks = self._mws_capacity_limit_blocks()
+        if limit_blocks <= 0:
+            return False, {}
+        pinned_total = self._current_mws_pinned_blocks_total()
+        incoming_blocks = self._estimate_mws_blocks_for_group(seq_group)
+        projected_total = pinned_total + incoming_blocks
+        detail: Dict[str, Union[int, float]] = {
+            "mws_pinned_blocks_total": int(pinned_total),
+            "mws_incoming_blocks": int(incoming_blocks),
+            "mws_projected_blocks_total": int(projected_total),
+            "mws_limit_blocks": int(limit_blocks),
+            "mws_admit_rho": float(self._recovery_cfg.mws_admit_rho),
+            "kv_total_blocks": int(
+                max(0, getattr(self.block_manager, "num_total_gpu_blocks", 0))),
+        }
+        if projected_total > limit_blocks:
+            return True, detail
+        return False, detail
+
+    def _apply_mws_hard_pin_for_group(self, seq_group: SequenceGroup, *,
+                                      reason: str) -> int:
+        if self._recovery_cfg.phase < 3:
+            return 0
+        pin_fn = getattr(self.block_manager, "apply_mws_hard_pin", None)
+        if not callable(pin_fn):
+            return 0
+        try:
+            return int(
+                pin_fn(
+                    seq_group,
+                    int(self._recovery_cfg.mws_prefix_tokens),
+                    int(self._recovery_cfg.mws_recent_tokens),
+                    reason=reason,
+                ))
+        except Exception:
+            return 0
+
+    def _has_fallback_decode_protected_group(self) -> bool:
+        threshold = int(self._recovery_cfg.fallback_protect_priority_gte)
+        if threshold < 0:
+            return False
+        for seq_group in self._iter_all_sequence_groups():
+            if int(getattr(seq_group, "priority", 0)) >= threshold:
+                return True
+        return False
+
+    def _has_request_fallback_mode(self) -> bool:
+        for seq_group in self._iter_all_sequence_groups():
+            for seq in seq_group.seqs:
+                if seq.recovery_state.mode == RecoveryMode.FALLBACK:
+                    return True
+        return False
+
+    def _is_seq_stalled_phase3(self, seq: Sequence, now_ns: int) -> bool:
+        last_progress = int(seq.recovery_state.last_progress_ts_ns)
+        if last_progress <= 0:
+            return False
+        threshold_ns = int(max(1.0, float(self._recovery_cfg.fallback_stall_ms))
+                           * 1e6)
+        return (now_ns - last_progress) >= threshold_ns
+
+    def _update_request_modes_phase3(
+            self, now_ns: int, *, global_mode: str, global_reason: str,
+            global_allow_normal: bool) -> Dict[str, Union[int, float]]:
+        counts = {
+            "normal": 0,
+            "recovery": 0,
+            "fallback": 0,
+            "switches": 0,
+            "residence_ms_sum": 0.0,
+            "residence_ms_count": 0,
+            "residence_ms_avg": 0.0,
+        }
+        stable_window_ms = float(self._recovery_cfg.mode_stable_window_ms)
+        pin_applied_groups: Set[int] = set()
+        for seq_group in self._iter_all_sequence_groups():
+            gid = id(seq_group)
+            for seq in seq_group.seqs:
+                state = seq.recovery_state
+                state.ensure_mode_initialized(now_ns)
+                prefix_blocks, recent_blocks = self._mws_blocks_for_seq(seq)
+                needs_full = state.needs_recovery()
+                needs_mws = state.needs_recovery_mws(prefix_blocks,
+                                                     recent_blocks)
+                mws_gpu, mws_host, mws_missing = state.count_mws_hints(
+                    prefix_blocks, recent_blocks)
+                mws_total = max(0, mws_gpu + mws_host + mws_missing)
+                mws_ready_ratio = (1.0 if mws_total == 0 else
+                                   (float(mws_gpu) / float(mws_total)))
+                mws_admit_rho = max(0.0, float(self._recovery_cfg.mws_admit_rho))
+                stalled = self._is_seq_stalled_phase3(seq, now_ns)
+                stalled_visible = bool(stalled and needs_mws)
+                progressed_since_mode_enter = (
+                    int(seq.recovery_state.last_progress_ts_ns)
+                    > int(state.mode_enter_ts_ns))
+                fallback_exit_ready = (
+                    mws_ready_ratio >= mws_admit_rho
+                    and progressed_since_mode_enter)
+
+                has_recovery_need = bool(needs_full or needs_mws)
+                if not state.recovery_enabled:
+                    # Requests never preempted should stay NORMAL and must not
+                    # be pulled into RECOVERY by global hysteresis.
+                    target = RecoveryMode.NORMAL
+                    reason = "no_recovery_state"
+                elif not has_recovery_need:
+                    if global_allow_normal:
+                        target = RecoveryMode.NORMAL
+                        reason = "drained_global_stable"
+                    else:
+                        # If drained but global guard is not yet stable, hold
+                        # current mode to suppress high-frequency toggling.
+                        target = state.mode
+                        reason = "drained_wait_global_stable"
+                elif state.mode == RecoveryMode.FALLBACK:
+                    # Keep FALLBACK sticky until request-level readiness holds.
+                    if stalled_visible:
+                        target = RecoveryMode.FALLBACK
+                        reason = "stalled_recovery"
+                    elif not needs_mws:
+                        # MWS contract already satisfied; don't keep toggling
+                        # FALLBACK for background deep-restore debt.
+                        target = RecoveryMode.RECOVERY
+                        reason = "mws_clear_recovery"
+                    elif global_mode == "fallback":
+                        target = RecoveryMode.FALLBACK
+                        reason = "global_fallback_hold"
+                    elif not fallback_exit_ready:
+                        target = RecoveryMode.FALLBACK
+                        # Avoid FALLBACK->RECOVERY->FALLBACK flip-flop when
+                        # readiness is transient but no real recovery progress
+                        # has been made in this fallback residency.
+                        if mws_ready_ratio < mws_admit_rho:
+                            reason = "mws_unready"
+                        else:
+                            reason = "fallback_wait_progress"
+                    else:
+                        target = RecoveryMode.RECOVERY
+                        reason = "mws_ready_recovery"
+                elif global_mode == "fallback":
+                    if not needs_mws:
+                        target = RecoveryMode.RECOVERY
+                        reason = "mws_clear_recovery"
+                    elif (not stalled_visible) and fallback_exit_ready:
+                        target = RecoveryMode.RECOVERY
+                        reason = "mws_ready_recovery"
+                    else:
+                        target = RecoveryMode.FALLBACK
+                        if stalled_visible:
+                            reason = "stalled_recovery"
+                        elif needs_mws:
+                            reason = "mws_unready"
+                        elif (not progressed_since_mode_enter):
+                            reason = "fallback_wait_progress"
+                        else:
+                            reason = str(global_reason)
+                else:
+                    target = RecoveryMode.RECOVERY
+                    reason = "needs_recovery"
+
+                prev_mode = state.mode
+                prev_mode_residence_ms = max(
+                    0.0, (now_ns - state.mode_enter_ts_ns) / 1e6)
+                # Only fallback uses forced fast switch here. Recovery fast
+                # path is handled at preempt-trigger site to avoid cycle-level
+                # NORMAL<->RECOVERY ping-pong.
+                force_switch = (target == RecoveryMode.FALLBACK
+                                and reason == "stalled_recovery")
+                switched = state.set_mode(
+                    target,
+                    reason=reason,
+                    now_ns=now_ns,
+                    stable_window_ms=stable_window_ms,
+                    force=force_switch,
+                )
+                residence_ms = max(0.0,
+                                   (now_ns - state.mode_enter_ts_ns) / 1e6)
+                counts["residence_ms_sum"] += residence_ms
+                counts["residence_ms_count"] += 1
+                seq.recovery_obs.mode = state.mode
+                seq.recovery_obs.mode_enter_ts_ns = state.mode_enter_ts_ns
+                if switched:
+                    counts["switches"] += 1
+                    log_recovery_event(
+                        "RECOVERY_REQUEST_MODE_SWITCH",
+                        req_id=seq_group.request_id,
+                        seq_id=seq.seq_id,
+                        reason=reason,
+                        detail={
+                            "from_mode": prev_mode.value,
+                            "to_mode": state.mode.value,
+                            "mode_switches": state.mode_switches,
+                            "global_mode": global_mode,
+                            "mws_prefix_blocks": prefix_blocks,
+                            "mws_recent_blocks": recent_blocks,
+                            "mws_gpu": mws_gpu,
+                            "mws_host": mws_host,
+                            "mws_missing": mws_missing,
+                            "mws_ready": int(not needs_mws),
+                            "mws_ready_ratio": round(mws_ready_ratio, 4),
+                            "mws_admit_rho": mws_admit_rho,
+                            "global_allow_normal": int(global_allow_normal),
+                            "mode_enter_ts_ns": state.mode_enter_ts_ns,
+                            "mode_residence_ms": round(residence_ms, 3),
+                            "prev_mode_residence_ms": round(
+                                prev_mode_residence_ms, 3),
+                        },
+                        block_manager=self.block_manager,
+                    )
+                    mode_enter_event = None
+                    if state.mode == RecoveryMode.RECOVERY:
+                        mode_enter_event = "MODE_ENTER_RECOVERY"
+                    elif state.mode == RecoveryMode.NORMAL:
+                        mode_enter_event = "MODE_ENTER_NORMAL"
+                    elif state.mode == RecoveryMode.FALLBACK:
+                        mode_enter_event = "MODE_ENTER_FALLBACK"
+                    if mode_enter_event is not None:
+                        log_recovery_event(
+                            mode_enter_event,
+                            req_id=seq_group.request_id,
+                            seq_id=seq.seq_id,
+                            reason=reason,
+                            detail={
+                                "from_mode": prev_mode.value,
+                                "to_mode": state.mode.value,
+                                "num_mode_switches": state.mode_switches,
+                                "mode_enter_ts_ns": state.mode_enter_ts_ns,
+                                "mode_residence_ms": round(residence_ms, 3),
+                            },
+                            block_manager=self.block_manager,
+                        )
+                    if state.mode == RecoveryMode.FALLBACK:
+                        log_recovery_event(
+                            "ENTER_FALLBACK",
+                            req_id=seq_group.request_id,
+                            seq_id=seq.seq_id,
+                            reason=reason,
+                            detail={
+                                "from_mode": prev_mode.value,
+                                "to_mode": state.mode.value,
+                                "num_mode_switches": state.mode_switches,
+                            },
+                            block_manager=self.block_manager,
+                        )
+                    elif prev_mode == RecoveryMode.FALLBACK:
+                        log_recovery_event(
+                            "EXIT_FALLBACK",
+                            req_id=seq_group.request_id,
+                            seq_id=seq.seq_id,
+                            reason=reason,
+                            detail={
+                                "from_mode": prev_mode.value,
+                                "to_mode": state.mode.value,
+                                "num_mode_switches": state.mode_switches,
+                            },
+                            block_manager=self.block_manager,
+                        )
+                    if (state.mode == RecoveryMode.RECOVERY
+                            and gid not in pin_applied_groups):
+                        pin_applied_groups.add(gid)
+                        self._apply_mws_hard_pin_for_group(
+                            seq_group, reason="mode_enter_recovery")
+                if state.mode == RecoveryMode.NORMAL:
+                    counts["normal"] += 1
+                elif state.mode == RecoveryMode.RECOVERY:
+                    counts["recovery"] += 1
+                else:
+                    counts["fallback"] += 1
+
+        residence_count = int(counts["residence_ms_count"])
+        if residence_count > 0:
+            counts["residence_ms_avg"] = (
+                float(counts["residence_ms_sum"]) / float(residence_count))
+        return counts
+
+    def _has_recovery_work(self) -> bool:
+        for seq_group in list(self.waiting) + list(self.running) + list(
+                self.swapped):
+            for seq in seq_group.seqs:
+                if not seq.recovery_state.recovery_enabled:
+                    continue
+                if seq.recovery_state.needs_recovery():
+                    return True
+        return False
+
+    def _active_recovery_request_ids(self) -> Set[str]:
+        out: Set[str] = set()
+        for seq_group in list(self.waiting) + list(self.running) + list(
+                self.swapped):
+            req_id = str(getattr(seq_group, "request_id", "")).strip()
+            if not req_id:
+                continue
+            for seq in seq_group.seqs:
+                if (seq.recovery_state.recovery_enabled
+                        and seq.recovery_state.needs_recovery()):
+                    out.add(req_id)
+                    break
+        return out
+
+    def _update_recovery_no_progress_cycles(self,
+                                            progressed_req_ids: Set[str]) -> None:
+        active_req_ids = self._active_recovery_request_ids()
+        # Drop stale entries for finished/drained requests.
+        stale = [
+            req_id for req_id in self._recovery_req_no_progress_cycles
+            if req_id not in active_req_ids
+        ]
+        for req_id in stale:
+            self._recovery_req_no_progress_cycles.pop(req_id, None)
+
+        for req_id in active_req_ids:
+            if req_id in progressed_req_ids:
+                self._recovery_req_no_progress_cycles[req_id] = 0
+                continue
+            prev = int(self._recovery_req_no_progress_cycles.get(req_id, 0))
+            self._recovery_req_no_progress_cycles[req_id] = min(10_000, prev + 1)
+
+    def _try_force_progress_for_starved(
+        self,
+        tasks: List[_RecoveryTask],
+        remaining_ms: float,
+        progressed_req_ids: Set[str],
+        blocks_to_swap_in: List[Tuple[int, int]],
+    ) -> Tuple[bool, float, Optional[str]]:
+        threshold = max(1, self._recovery_force_progress_cycles)
+        starved_tasks = [
+            t for t in tasks
+            if (t.seq_group.request_id not in progressed_req_ids)
+            and self._recovery_req_no_progress_cycles.get(
+                t.seq_group.request_id, 0) >= threshold
+        ]
+        starved_tasks.sort(
+            key=lambda t: (
+                self._recovery_req_no_progress_cycles.get(
+                    t.seq_group.request_id, 0),
+                1 if t.stalled else 0,
+                t.priority,
+                -t.est_cost_ms,
+            ),
+            reverse=True,
+        )
+        for task in starved_tasks:
+            req_id = task.seq_group.request_id
+            no_progress_cycles = int(
+                self._recovery_req_no_progress_cycles.get(req_id, 0))
+            if task.kind == "swap":
+                req_id = task.seq_group.request_id
+                k_swap_target = 1
+                if no_progress_cycles >= threshold:
+                    k_swap_target = 2
+                force_cost_ms = max(1e-6,
+                                    float(task.est_cost_ms) *
+                                    float(k_swap_target))
+                if remaining_ms < force_cost_ms:
+                    if remaining_ms < max(1e-6, float(task.est_cost_ms)):
+                        continue
+                    k_swap_target = 1
+                    force_cost_ms = max(1e-6, float(task.est_cost_ms))
+                is_prefill = task.seq_group.is_prefill()
+                alloc_status = self.block_manager.can_swap_in(
+                    task.seq_group,
+                    self._get_num_lookahead_slots(is_prefill,
+                                                  enable_chunking=False),
+                    k_swap_max=k_swap_target)
+                if alloc_status == AllocStatus.NEVER:
+                    continue
+                k_done, _ = self._swap_in(task.seq_group, blocks_to_swap_in,
+                                          k_swap_target)
+                if k_done <= 0:
+                    continue
+                remaining_ms -= max(1e-6,
+                                    float(task.est_cost_ms) * float(k_done))
+                try:
+                    log_recovery_event(
+                        "RECOVERY_FORCE_PROGRESS",
+                        req_id=req_id,
+                        seq_id=(task.seq.seq_id
+                                if task.seq is not None else None),
+                        reason="no_progress_guard_swap",
+                        detail={
+                            "no_progress_cycles": no_progress_cycles,
+                            "threshold_cycles": threshold,
+                            "k_swap_target": int(k_swap_target),
+                            "k_swap_done": int(k_done),
+                            "remaining_ms_after": round(remaining_ms, 6),
+                        },
+                        block_manager=self.block_manager,
+                    )
+                except Exception:
+                    pass
+                return True, remaining_ms, req_id
+            if task.kind == "recompute" and task.seq is not None:
+                force_tokens = max(
+                    1,
+                    min(int(task.delta_tokens),
+                        self._recovery_force_recompute_tokens),
+                )
+                force_cost_ms = max(
+                    1e-6,
+                    float(task.est_cost_ms) * float(force_tokens) /
+                    float(max(1, int(task.delta_tokens))),
+                )
+                if remaining_ms < force_cost_ms:
+                    continue
+                delta_done, task_ms = self._execute_recompute_micro_task(
+                    task.seq_group,
+                    task.seq,
+                    force_tokens,
+                )
+                if delta_done <= 0:
+                    continue
+                remaining_ms -= max(force_cost_ms, task_ms)
+                try:
+                    log_recovery_event(
+                        "RECOVERY_FORCE_PROGRESS",
+                        req_id=req_id,
+                        seq_id=task.seq.seq_id,
+                        reason="no_progress_guard_recompute",
+                        detail={
+                            "no_progress_cycles": no_progress_cycles,
+                            "threshold_cycles": threshold,
+                            "force_tokens": int(force_tokens),
+                            "remaining_ms_after": round(remaining_ms, 6),
+                        },
+                        block_manager=self.block_manager,
+                    )
+                except Exception:
+                    pass
+                return True, remaining_ms, req_id
+        return False, remaining_ms, None
+
     def _run_recovery_tail_micro_tasks(
             self, budget_ms: float,
             blocks_to_swap_in: List[Tuple[int, int]]) -> Tuple[int, float]:
         # Phase2: allow tail-stage recompute even when swapped queue is empty.
         if budget_ms <= 0.0:
+            self._update_recovery_no_progress_cycles(set())
             return 0, 0.0
         start = time.perf_counter()
         remaining_ms = max(0.0, float(budget_ms))
         executed_tasks = 0
+        progressed_req_ids: Set[str] = set()
+        forced_tasks = 0
 
         while remaining_ms > 0.0:
             tasks = self._select_recovery_tasks(remaining_ms)
@@ -2058,12 +3101,27 @@ class Scheduler:
                     budget_blocked += 1
                     continue
                 if task.kind == "swap":
+                    req_id = task.seq_group.request_id
+                    no_progress_cycles = int(
+                        self._recovery_req_no_progress_cycles.get(req_id, 0))
+                    k_swap_target = 1
+                    if task.stalled or (
+                            no_progress_cycles >=
+                            self._recovery_force_progress_cycles):
+                        k_swap_target = 2
+                    swap_cost_ms = est_cost_ms * float(k_swap_target)
+                    if remaining_ms < swap_cost_ms:
+                        if remaining_ms < est_cost_ms:
+                            budget_blocked += 1
+                            continue
+                        k_swap_target = 1
+                        swap_cost_ms = est_cost_ms
                     is_prefill = task.seq_group.is_prefill()
                     alloc_status = self.block_manager.can_swap_in(
                         task.seq_group,
                         self._get_num_lookahead_slots(
                             is_prefill, enable_chunking=False),
-                        k_swap_max=1)
+                        k_swap_max=k_swap_target)
                     # For stalled recovery, allow a best-effort swap even if
                     # allocator reports LATER; this helps shrink long gaps on
                     # tail blocks without changing normal-path aggressiveness.
@@ -2071,11 +3129,13 @@ class Scheduler:
                         continue
                     if alloc_status == AllocStatus.LATER and (not task.stalled):
                         continue
-                    k_done, _ = self._swap_in(task.seq_group, blocks_to_swap_in, 1)
+                    k_done, _ = self._swap_in(task.seq_group, blocks_to_swap_in,
+                                              k_swap_target)
                     if k_done <= 0:
                         continue
-                    remaining_ms -= est_cost_ms
+                    remaining_ms -= max(est_cost_ms, est_cost_ms * float(k_done))
                     executed_tasks += 1
+                    progressed_req_ids.add(task.seq_group.request_id)
                     executed_one = True
                     break
                 if task.kind == "recompute" and task.seq is not None:
@@ -2085,8 +3145,26 @@ class Scheduler:
                         continue
                     remaining_ms -= max(est_cost_ms, task_ms)
                     executed_tasks += 1
+                    progressed_req_ids.add(task.seq_group.request_id)
                     executed_one = True
                     break
+
+            # Fairness guard: even if the loop already made progress, allow one
+            # extra micro-task for a different starved request per cycle.
+            if forced_tasks < self._recovery_force_max_tasks_per_cycle:
+                forced_done, remaining_ms, forced_req_id = (
+                    self._try_force_progress_for_starved(
+                        tasks,
+                        remaining_ms,
+                        progressed_req_ids,
+                        blocks_to_swap_in,
+                    ))
+                if forced_done and forced_req_id is not None:
+                    executed_tasks += 1
+                    progressed_req_ids.add(forced_req_id)
+                    forced_tasks += 1
+                    if not executed_one:
+                        continue
 
             if not executed_one:
                 # Count only budget-limited drops. If tasks are blocked by
@@ -2096,6 +3174,7 @@ class Scheduler:
                     add_over_budget_drop(budget_blocked)
                 break
 
+        self._update_recovery_no_progress_cycles(progressed_req_ids)
         pending = len(self._select_recovery_tasks(0.0))
         if pending > 0 and remaining_ms <= 0.0:
             add_over_budget_drop(pending)
@@ -2245,7 +3324,11 @@ class Scheduler:
             for seq in seq_group.seqs:
                 seq.ensure_recovery_blocks()
                 seq.recovery_state.recovery_enabled = True
-                seq.recovery_state.mode = RecoveryMode.RECOVERY
+                seq.recovery_state.set_mode(
+                    RecoveryMode.RECOVERY,
+                    reason="preempt_triggered",
+                    force=True,
+                )
                 seq.recovery_state.num_recovery_attempts += 1
                 seq.recovery_state.swap_frontier = 0
                 seq.recovery_state.rec_frontier = 0
@@ -2265,11 +3348,103 @@ class Scheduler:
                 )
         except Exception:
             pass
+        if preemption_mode == PreemptionMode.SWAP:
+            self._apply_mws_hard_pin_for_group(
+                seq_group, reason="preempt_enter_recovery")
+            try:
+                if self._recovery_cfg.phase >= 3:
+                    for seq in seq_group.seqs:
+                        raw_block_table = self.block_manager.get_block_table(
+                            seq)
+                        if len(raw_block_table) == 0:
+                            continue
+                        _, vis_summary = self._visibility_contract_summary(
+                            seq, len(raw_block_table))
+                        log_recovery_event(
+                            "VISIBILITY_WINDOW_ENFORCED",
+                            req_id=seq_group.request_id,
+                            seq_id=seq.seq_id,
+                            reason="preempt_visibility_contract",
+                            detail={
+                                "A_tokens": int(
+                                    vis_summary.get("A_tokens", 0)),
+                                "W_min_tokens": int(
+                                    vis_summary.get("W_min_tokens", 0)),
+                                "visible_tokens": int(
+                                    vis_summary.get("visible_tokens", 0)),
+                                "visible_blocks": int(
+                                    vis_summary.get("visible_blocks", 0)),
+                                "masked_blocks": 0,
+                            },
+                            block_manager=self.block_manager,
+                        )
+                can_swap_out = self.block_manager.can_swap_out(seq_group)
+                if (not can_swap_out) and self._recovery_cfg.phase >= 3:
+                    relax_fn = getattr(self.block_manager,
+                                       "relax_mws_pin_for_swap", None)
+                    relaxed_blocks = 0
+                    if callable(relax_fn):
+                        relaxed_blocks = int(
+                            relax_fn(seq_group,
+                                     min_unpinned=1,
+                                     reason="preempt_swap_blocked"))
+                    if relaxed_blocks > 0:
+                        can_swap_out = self.block_manager.can_swap_out(
+                            seq_group)
+                        if can_swap_out:
+                            log_recovery_event(
+                                "MWS_PIN_SWAPOUT_RELAXED",
+                                req_id=seq_group.request_id,
+                                reason="swap_out_reenabled",
+                                detail={"relaxed_blocks": relaxed_blocks},
+                                block_manager=self.block_manager,
+                            )
+                if not can_swap_out:
+                    try:
+                        for seq in seq_group.seqs:
+                            log_recovery_event(
+                                "SWAP_OUT",
+                                req_id=seq_group.request_id,
+                                seq_id=seq.seq_id,
+                                reason="swap_out_blocked",
+                                detail={
+                                    "blocks_count": 0,
+                                    "bytes": None,
+                                    "swapped_indices_sample": [],
+                                    "pinned_indices_sample":
+                                    seq.recovery_state.
+                                    get_pinned_blocks_sorted()[:16],
+                                },
+                                block_manager=self.block_manager,
+                            )
+                    except Exception:
+                        pass
+                    if seq_group.get_max_num_running_seqs() == 1:
+                        preemption_mode = PreemptionMode.RECOMPUTE
+                        log_recovery_event(
+                            "MWS_PIN_SWAPOUT_BLOCKED",
+                            req_id=seq_group.request_id,
+                            reason="fallback_to_recompute",
+                            detail={
+                                "preempt_mode_before": "SWAP",
+                                "preempt_mode_after": "RECOMPUTE",
+                            },
+                            block_manager=self.block_manager,
+                        )
+            except Exception:
+                pass
         try:
             for seq in seq_group.seqs:
                 seq.recovery_obs.preempt_cnt += 1
         except Exception:
             pass
+        req_id = str(getattr(seq_group, "request_id", "")).strip()
+        if req_id:
+            # Start fairness clock at preempt so freshly preempted requests can
+            # get a guaranteed tiny recovery slice in the next tail window.
+            prev = int(self._recovery_req_no_progress_cycles.get(req_id, 0))
+            self._recovery_req_no_progress_cycles[req_id] = max(
+                prev, self._recovery_force_progress_cycles)
         self.num_cumulative_preemption += 1
 
         if preemption_mode == PreemptionMode.RECOMPUTE:

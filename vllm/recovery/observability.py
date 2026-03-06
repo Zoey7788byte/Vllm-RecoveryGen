@@ -70,6 +70,17 @@ class RecoveryConfig:
     dplus_ms: float
     dminus_ms: float
     prefetch_max_blocks: int
+    mode_stable_window_ms: float
+    mws_prefix_tokens: int
+    mws_recent_tokens: int
+    mws_admit_rho: float
+    fallback_stall_ms: float
+    fallback_residence_ms: float
+    fallback_preempt_threshold: int
+    fallback_protect_priority_gte: int
+    fallback_pause_decode: bool
+    fallback_decode_interval_cycles: int
+    fallback_budget_boost_ms: float
 
     @classmethod
     def from_env_or_json(cls) -> "RecoveryConfig":
@@ -90,6 +101,17 @@ class RecoveryConfig:
             "dplus_ms": envs.REC_DPLUS_MS,
             "dminus_ms": envs.REC_DMINUS_MS,
             "prefetch_max_blocks": envs.REC_PREFETCH_MAX_BLOCKS,
+            "mode_stable_window_ms": envs.REC_MODE_STABLE_WINDOW_MS,
+            "mws_prefix_tokens": envs.REC_MWS_PREFIX_TOKENS,
+            "mws_recent_tokens": envs.REC_MWS_RECENT_TOKENS,
+            "mws_admit_rho": envs.REC_MWS_ADMIT_RHO,
+            "fallback_stall_ms": envs.REC_FALLBACK_STALL_MS,
+            "fallback_residence_ms": envs.REC_FALLBACK_RESIDENCE_MS,
+            "fallback_preempt_threshold": envs.REC_FALLBACK_PREEMPT_THRESHOLD,
+            "fallback_protect_priority_gte": envs.REC_FALLBACK_PROTECT_PRIORITY_GTE,
+            "fallback_pause_decode": envs.REC_FALLBACK_PAUSE_DECODE,
+            "fallback_decode_interval_cycles": envs.REC_FALLBACK_DECODE_INTERVAL_CYCLES,
+            "fallback_budget_boost_ms": envs.REC_FALLBACK_BUDGET_BOOST_MS,
         }
 
         json_cfg: Dict[str, Any] = {}
@@ -189,6 +211,60 @@ class RecoveryConfig:
                 v = _coerce_int(json_cfg.get("prefetch_max_blocks"))
                 if v is not None:
                     env_cfg["prefetch_max_blocks"] = v
+            if "mode_stable_window_ms" in json_cfg:
+                try:
+                    env_cfg["mode_stable_window_ms"] = float(
+                        json_cfg.get("mode_stable_window_ms"))
+                except Exception:
+                    pass
+            if "mws_prefix_tokens" in json_cfg:
+                v = _coerce_int(json_cfg.get("mws_prefix_tokens"))
+                if v is not None:
+                    env_cfg["mws_prefix_tokens"] = v
+            if "mws_recent_tokens" in json_cfg:
+                v = _coerce_int(json_cfg.get("mws_recent_tokens"))
+                if v is not None:
+                    env_cfg["mws_recent_tokens"] = v
+            if "mws_admit_rho" in json_cfg:
+                try:
+                    env_cfg["mws_admit_rho"] = float(json_cfg.get(
+                        "mws_admit_rho"))
+                except Exception:
+                    pass
+            if "fallback_stall_ms" in json_cfg:
+                try:
+                    env_cfg["fallback_stall_ms"] = float(
+                        json_cfg.get("fallback_stall_ms"))
+                except Exception:
+                    pass
+            if "fallback_residence_ms" in json_cfg:
+                try:
+                    env_cfg["fallback_residence_ms"] = float(
+                        json_cfg.get("fallback_residence_ms"))
+                except Exception:
+                    pass
+            if "fallback_preempt_threshold" in json_cfg:
+                v = _coerce_int(json_cfg.get("fallback_preempt_threshold"))
+                if v is not None:
+                    env_cfg["fallback_preempt_threshold"] = v
+            if "fallback_protect_priority_gte" in json_cfg:
+                v = _coerce_int(json_cfg.get("fallback_protect_priority_gte"))
+                if v is not None:
+                    env_cfg["fallback_protect_priority_gte"] = v
+            if "fallback_pause_decode" in json_cfg:
+                v = _coerce_bool(json_cfg.get("fallback_pause_decode"))
+                if v is not None:
+                    env_cfg["fallback_pause_decode"] = v
+            if "fallback_decode_interval_cycles" in json_cfg:
+                v = _coerce_int(json_cfg.get("fallback_decode_interval_cycles"))
+                if v is not None:
+                    env_cfg["fallback_decode_interval_cycles"] = v
+            if "fallback_budget_boost_ms" in json_cfg:
+                try:
+                    env_cfg["fallback_budget_boost_ms"] = float(
+                        json_cfg.get("fallback_budget_boost_ms"))
+                except Exception:
+                    pass
 
         return cls(
             obs_enabled=bool(env_cfg["obs_enabled"]),
@@ -207,6 +283,23 @@ class RecoveryConfig:
             dplus_ms=max(0.0, float(env_cfg["dplus_ms"])),
             dminus_ms=max(0.0, float(env_cfg["dminus_ms"])),
             prefetch_max_blocks=max(0, int(env_cfg["prefetch_max_blocks"])),
+            mode_stable_window_ms=max(1.0, float(
+                env_cfg["mode_stable_window_ms"])),
+            mws_prefix_tokens=max(0, int(env_cfg["mws_prefix_tokens"])),
+            mws_recent_tokens=max(0, int(env_cfg["mws_recent_tokens"])),
+            mws_admit_rho=max(0.0, float(env_cfg["mws_admit_rho"])),
+            fallback_stall_ms=max(1.0, float(env_cfg["fallback_stall_ms"])),
+            fallback_residence_ms=max(1.0, float(
+                env_cfg["fallback_residence_ms"])),
+            fallback_preempt_threshold=max(
+                1, int(env_cfg["fallback_preempt_threshold"])),
+            fallback_protect_priority_gte=int(
+                env_cfg["fallback_protect_priority_gte"]),
+            fallback_pause_decode=bool(env_cfg["fallback_pause_decode"]),
+            fallback_decode_interval_cycles=max(
+                1, int(env_cfg["fallback_decode_interval_cycles"])),
+            fallback_budget_boost_ms=max(
+                0.0, float(env_cfg["fallback_budget_boost_ms"])),
         )
 
 
@@ -252,12 +345,25 @@ class _RecoveryEventLogger:
         "PREEMPT_TRIGGERED",
         "CYCLE_SLACK_COMPUTED",
         "RECOVERY_MODE_SWITCH",
+        "RECOVERY_REQUEST_MODE_SWITCH",
+        "MODE_ENTER_RECOVERY",
+        "MODE_ENTER_NORMAL",
+        "MODE_ENTER_FALLBACK",
+        "ENTER_FALLBACK",
+        "EXIT_FALLBACK",
+        "ADMISSION_THROTTLE_MWS",
         "RECOVERY_BUDGET_DECISION",
         "RECOVERY_STATE_CREATED",
         "RECOMPUTE_MICRO",
         "RECOVERY_PROGRESS_COMMIT",
         "SWAP_IN_MICRO",
         "SWAP_PREFETCH_READY",
+        "MWS_PIN_APPLIED",
+        "MWS_PIN_SWAPOUT_BLOCKED",
+        "MWS_PIN_RELEASED",
+        "SWAP_OUT_PINNED_SKIPPED",
+        "VISIBILITY_CONTRACT_ADMIT",
+        "VISIBILITY_WINDOW_ENFORCED",
         "SWAP_IN_SKIP_ALREADY_RESTORED",
         "RECOVERY_REMAINING_HOST_BLOCKS",
         "RECOVERY_STALLED",
@@ -322,6 +428,19 @@ class _RecoveryCsvLogger:
         "mode_cnt_normal",
         "mode_cnt_recovery",
         "mode_cnt_fallback",
+        "req_mode_cnt_normal",
+        "req_mode_cnt_recovery",
+        "req_mode_cnt_fallback",
+        "fallback_cnt",
+        "req_mode_switches",
+        "req_mode_residence_ms_avg",
+        "mode_switch_delta",
+        "admission_throttle",
+        "mws_pinned_blocks_total",
+        "mws_limit_blocks",
+        "visibility_enforced",
+        "visible_tokens",
+        "visible_recent_tokens",
         "restore_progress_stall_ms",
         "cycle_wall_ms",
         "prefill_tokens",
@@ -569,6 +688,11 @@ class RecoveryObservability:
         )
 
     def _resolve_mode(self, cycle_context: Dict[str, Any]) -> str:
+        mode_override = cycle_context.get("recovery_mode", None)
+        if isinstance(mode_override, str):
+            m = mode_override.strip().lower()
+            if m in ("normal", "recovery", "fallback"):
+                return m
         preempted = int(cycle_context.get("preempted", 0))
         swapin_blocks = int(cycle_context.get("swapin_blocks", 0))
         swapout_blocks = int(cycle_context.get("swapout_blocks", 0))
@@ -727,6 +851,27 @@ class RecoveryObservability:
                 "mode_cnt_normal": cycle_context.get("mode_cnt_normal", 1),
                 "mode_cnt_recovery": cycle_context.get("mode_cnt_recovery", 0),
                 "mode_cnt_fallback": cycle_context.get("mode_cnt_fallback", 0),
+                "req_mode_cnt_normal": cycle_context.get("req_mode_normal", 0),
+                "req_mode_cnt_recovery": cycle_context.get(
+                    "req_mode_recovery", 0),
+                "req_mode_cnt_fallback": cycle_context.get(
+                    "req_mode_fallback", 0),
+                "fallback_cnt": cycle_context.get("req_mode_fallback", 0),
+                "req_mode_switches": cycle_context.get(
+                    "req_mode_switches", 0),
+                "req_mode_residence_ms_avg": cycle_context.get(
+                    "req_mode_residence_ms_avg", 0.0),
+                "mode_switch_delta": cycle_context.get("mode_switch_delta", 0),
+                "admission_throttle": cycle_context.get(
+                    "admission_throttle", 0),
+                "mws_pinned_blocks_total": cycle_context.get(
+                    "mws_pinned_blocks_total", 0),
+                "mws_limit_blocks": cycle_context.get("mws_limit_blocks", 0),
+                "visibility_enforced": cycle_context.get(
+                    "visibility_enforced", 0),
+                "visible_tokens": cycle_context.get("visible_tokens", 0),
+                "visible_recent_tokens": cycle_context.get(
+                    "visible_recent_tokens", 0),
                 "restore_progress_stall_ms": cycle_context.get(
                     "restore_progress_stall_ms", 0),
                 "cycle_wall_ms": round(cycle_wall_ms, 3),
