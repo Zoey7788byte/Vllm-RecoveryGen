@@ -776,7 +776,10 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
     def can_swap_in(self,
                     seq_group: SequenceGroup,
                     num_lookahead_slots: int,
-                    k_swap_max: Optional[int] = None) -> AllocStatus:
+                    k_swap_max: Optional[int] = None,
+                    *,
+                    stalled: bool = False,
+                    reserve_blocks: Optional[int] = None) -> AllocStatus:
         """Returns the AllocStatus for the given sequence_group 
         with num_lookahead_slots.
 
@@ -805,11 +808,17 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
             if self.block_allocator.get_num_total_blocks(
                     Device.GPU) < num_blocks_touched:
                 return AllocStatus.NEVER
-            elif self.block_allocator.get_num_free_blocks(
-                    Device.GPU) - num_blocks_touched >= self.watermark_blocks:
+            free_gpu_blocks = self.block_allocator.get_num_free_blocks(Device.GPU)
+            watermark_required = self.watermark_blocks
+            if stalled and int(k_swap_max) == 1:
+                # Unlock one-block stalled recovery with a looser watermark.
+                watermark_required = max(0, self.watermark_blocks - 1)
+            reserve_required = (self.watermark_blocks if reserve_blocks is None
+                                else max(0, int(reserve_blocks)))
+            headroom_required = max(watermark_required, reserve_required)
+            if free_gpu_blocks - num_blocks_touched >= headroom_required:
                 return AllocStatus.OK
-            else:
-                return AllocStatus.LATER
+            return AllocStatus.LATER
         return self._can_swap(seq_group, Device.GPU, SequenceStatus.SWAPPED,
                               num_lookahead_slots)
 
@@ -878,6 +887,8 @@ class SelfAttnBlockSpaceManager(BlockSpaceManager):
                 observe_swap_task(swap_task_ms, k_done)
             if k_done <= 0:
                 continue
+            # Swap-in progress should refresh starvation timestamp immediately.
+            seq.recovery_state.note_progress()
 
             # Refresh the block ids of the table (post-swap)
             self.block_tables[seq.seq_id].update(blocks)

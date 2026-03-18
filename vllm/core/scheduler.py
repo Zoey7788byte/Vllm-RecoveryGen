@@ -36,6 +36,9 @@ ENABLE_ARTIFICIAL_PREEMPT = bool(
 ARTIFICIAL_PREEMPTION_PROB = 0.5
 ARTIFICIAL_PREEMPTION_MAX_CNT = 500
 RECOVERY_RECOMPUTE_DELTA_TOKENS = 128
+# Small stalled threshold for recovery candidate priority (Patch 2).
+RECOVERY_PRIORITY_STALL_MS = 200.0
+RECOVERY_SWAP_UNLOCK_RESERVE_BLOCKS = 1
 
 
 class PreemptionMode(enum.Enum):
@@ -820,10 +823,25 @@ class Scheduler:
 
             # If the sequence group cannot be swapped in, stop.
             is_prefill = seq_group.is_prefill()
+            k_swap_plan_max = (k_budget_remaining if needs_recovery else 0)
             alloc_status = self.block_manager.can_swap_in(
                 seq_group,
                 self._get_num_lookahead_slots(is_prefill, enable_chunking),
-                k_swap_max=(k_budget_remaining if needs_recovery else 0))
+                k_swap_max=k_swap_plan_max)
+            use_unlock_swap = False
+            if (alloc_status == AllocStatus.LATER and needs_recovery
+                    and k_budget_remaining > 0
+                    and self._is_seq_group_stalled_for_recovery_priority(
+                        seq_group)):
+                alloc_status = self.block_manager.can_swap_in(
+                    seq_group,
+                    self._get_num_lookahead_slots(is_prefill, enable_chunking),
+                    k_swap_max=1,
+                    stalled=True,
+                    reserve_blocks=RECOVERY_SWAP_UNLOCK_RESERVE_BLOCKS,
+                )
+                if alloc_status != AllocStatus.NEVER:
+                    use_unlock_swap = True
             if alloc_status == AllocStatus.LATER:
                 break
             elif alloc_status == AllocStatus.NEVER:
@@ -850,10 +868,11 @@ class Scheduler:
                     swapped_queue.popleft()
                     continue
 
+            k_swap_exec_max = (1 if use_unlock_swap else
+                               (k_budget_remaining if needs_recovery else 0))
             k_done, fully_restored = self._swap_in(seq_group,
                                                    blocks_to_swap_in,
-                                                   (k_budget_remaining
-                                                    if needs_recovery else 0))
+                                                   k_swap_exec_max)
             k_budget_remaining = max(0, k_budget_remaining - max(0, k_done))
             if not fully_restored:
                 if self._can_run_with_visibility_contract(seq_group):
@@ -1877,35 +1896,29 @@ class Scheduler:
             else:
                 self._recovery_mode = ("recovery"
                                        if has_recovery_work else "normal")
-        # In high-load pressure cycles, treat slack as unavailable to protect
-        # online path, but keep a tiny continuous recovery slice to avoid
-        # recovery starvation and visibility-signal collapse.
+        # In high-load pressure cycles, apply headroom-tiered throttling
+        # instead of hard zeroing recovery budget.
         if (online_first_phase2 and self._recovery_mode != "fallback"
                 and (hard_pressure or high_load_pressure)):
-            s_ms = 0.0
-            slack_forced_zero = 1
-            # Escape hatch: when recovery is stalled, grant a tiny budget so
-            # progress can continue and long swap-in gaps are capped.
             fresh_preempt_edge = int(
                 scheduler_outputs.preempted > 0
                 and self._recovery_prev_preempt_delta <= 0)
-            proactive_preempt = (
-                phase3_enabled
-                and has_recovery_work
-                and fresh_preempt_edge == 1
-            )
-            low_budget_progress = (
-                has_recovery_work
-                and swapped_len > 0
-                and raw_s_ms > 0.0
-                and hard_low_headroom == 0
-            )
-            if stalled or proactive_preempt or low_budget_progress:
-                s_ms = min(raw_s_ms,
-                           max(1e-3, float(self._recovery_cfg.budget_min_ms)))
-                if s_ms > 0.0:
-                    slack_forced_zero = 0
-                    slack_escape_hatch = 1
+            watermark_hi_blocks = max(0, int(mode_watermark_hi_blocks))
+            watermark_lo_blocks = max(0, watermark_hi_blocks - 1)
+            tiny_budget_ms = max(1e-3, float(self._recovery_cfg.swap_ms_per_block))
+            low_budget_ms = tiny_budget_ms
+
+            if free_gpu_blocks > watermark_hi_blocks:
+                s_ms = raw_s_ms
+            elif free_gpu_blocks > watermark_lo_blocks:
+                s_ms = min(raw_s_ms, low_budget_ms)
+            else:
+                s_ms = min(raw_s_ms, tiny_budget_ms)
+
+            if s_ms <= 0.0:
+                slack_forced_zero = 1
+            elif s_ms < raw_s_ms:
+                slack_escape_hatch = 1
         elif online_first_phase2 and self._recovery_mode == "fallback":
             # Fallback uses soft suppression under sustained waiting pressure.
             # Avoid full freezes that can collapse swap/visibility signals.
@@ -2245,6 +2258,9 @@ class Scheduler:
             )
         except Exception:
             pass
+        if delta_done > 0:
+            # Keep progress timestamp fresh even if commit logging fails.
+            seq.recovery_state.note_progress()
         try:
             if delta_done > 0:
                 start_block = before // seq.block_size
@@ -2278,7 +2294,7 @@ class Scheduler:
 
     def _select_recovery_tasks(self, budget_ms: float) -> List[_RecoveryTask]:
         now_ns = time.time_ns()
-        stall_threshold_ns = int(max(1.0, float(self._recovery_cfg.stall_ms)) * 1e6)
+        stall_threshold_ns = int(max(1.0, RECOVERY_PRIORITY_STALL_MS) * 1e6)
         phase3_enabled = self._recovery_cfg.phase >= 3
         waiting_pressure = len(self.waiting) > 0
         recent_preempt_pressure = self._recovery_prev_preempt_delta > 0
@@ -2442,6 +2458,24 @@ class Scheduler:
                     continue
                 if now_ns - last_progress >= threshold_ns:
                     return True
+        return False
+
+    def _is_seq_group_stalled_for_recovery_priority(
+            self,
+            seq_group: SequenceGroup,
+            now_ns: Optional[int] = None) -> bool:
+        threshold_ns = int(max(1.0, RECOVERY_PRIORITY_STALL_MS) * 1e6)
+        ts_now = int(now_ns if now_ns is not None else time.time_ns())
+        for seq in seq_group.seqs:
+            if not seq.recovery_state.recovery_enabled:
+                continue
+            if not seq.recovery_state.needs_recovery():
+                continue
+            last_progress = int(seq.recovery_state.last_progress_ts_ns)
+            if last_progress <= 0:
+                continue
+            if ts_now - last_progress >= threshold_ns:
+                return True
         return False
 
     def _iter_all_sequence_groups(self) -> Iterable[SequenceGroup]:
@@ -3008,6 +3042,20 @@ class Scheduler:
                     self._get_num_lookahead_slots(is_prefill,
                                                   enable_chunking=False),
                     k_swap_max=k_swap_target)
+                if (alloc_status == AllocStatus.LATER and task.stalled
+                        and remaining_ms > 0.0):
+                    alloc_status_unlock = self.block_manager.can_swap_in(
+                        task.seq_group,
+                        self._get_num_lookahead_slots(
+                            is_prefill, enable_chunking=False),
+                        k_swap_max=1,
+                        stalled=True,
+                        reserve_blocks=RECOVERY_SWAP_UNLOCK_RESERVE_BLOCKS,
+                    )
+                    if alloc_status_unlock != AllocStatus.NEVER:
+                        alloc_status = alloc_status_unlock
+                        k_swap_target = 1
+                        force_cost_ms = max(1e-6, float(task.est_cost_ms))
                 if alloc_status == AllocStatus.NEVER:
                     continue
                 k_done, _ = self._swap_in(task.seq_group, blocks_to_swap_in,
@@ -3122,6 +3170,19 @@ class Scheduler:
                         self._get_num_lookahead_slots(
                             is_prefill, enable_chunking=False),
                         k_swap_max=k_swap_target)
+                    if (alloc_status == AllocStatus.LATER and task.stalled
+                            and remaining_ms > 0.0):
+                        alloc_status_unlock = self.block_manager.can_swap_in(
+                            task.seq_group,
+                            self._get_num_lookahead_slots(
+                                is_prefill, enable_chunking=False),
+                            k_swap_max=1,
+                            stalled=True,
+                            reserve_blocks=RECOVERY_SWAP_UNLOCK_RESERVE_BLOCKS,
+                        )
+                        if alloc_status_unlock != AllocStatus.NEVER:
+                            alloc_status = alloc_status_unlock
+                            k_swap_target = 1
                     # For stalled recovery, allow a best-effort swap even if
                     # allocator reports LATER; this helps shrink long gaps on
                     # tail blocks without changing normal-path aggressiveness.

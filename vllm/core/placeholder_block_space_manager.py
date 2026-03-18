@@ -49,7 +49,10 @@ class PlaceholderBlockSpaceManager(BlockSpaceManager):
     def can_swap_in(self,
                     seq_group: SequenceGroup,
                     num_lookahead_slots: int,
-                    k_swap_max: Optional[int] = None) -> AllocStatus:
+                    k_swap_max: Optional[int] = None,
+                    *,
+                    stalled: bool = False,
+                    reserve_blocks: Optional[int] = None) -> AllocStatus:
         return AllocStatus.OK
 
     def swap_in(
